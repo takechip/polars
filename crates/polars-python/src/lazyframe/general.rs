@@ -1449,6 +1449,88 @@ impl PyLazyFrame {
         ldf.with_row_index(name, offset).into()
     }
 
+    #[cfg(feature = "asof_join")]
+    #[pyo3(signature = (other, pairs, left_by, right_by, allow_parallel, force_parallel, suffix, strategy, tolerance, tolerance_str, coalesce, allow_eq, check_sortedness))]
+    fn join_asof_many(
+        &self,
+        other: Self,
+        pairs: Vec<(PyExpr, PyExpr, Option<PyBackedStr>)>,
+        left_by: Option<Vec<PyBackedStr>>,
+        right_by: Option<Vec<PyBackedStr>>,
+        allow_parallel: bool,
+        force_parallel: bool,
+        suffix: String,
+        strategy: Wrap<AsofStrategy>,
+        tolerance: Option<Wrap<AnyValue<'_>>>,
+        tolerance_str: Option<String>,
+        coalesce: bool,
+        allow_eq: bool,
+        check_sortedness: bool,
+    ) -> PyResult<Self> {
+        let coalesce = if coalesce {
+            JoinCoalesce::CoalesceColumns
+        } else {
+            JoinCoalesce::KeepColumns
+        };
+        let mut left_on = Vec::with_capacity(pairs.len());
+        let mut right_on = Vec::with_capacity(pairs.len());
+        let pairs = pairs
+            .into_iter()
+            .map(|(left_expr, right_expr, pair_suffix)| {
+                let left_expr = left_expr.inner;
+                let right_expr = right_expr.inner;
+
+                left_on.push(left_expr.clone());
+                right_on.push(right_expr.clone());
+
+                Ok(AsofJoinPair {
+                    left_on_name: left_expr
+                        .clone()
+                        .meta()
+                        .output_name()
+                        .map_err(PyPolarsErr::from)?
+                        .clone(),
+                    right_on_name: right_expr
+                        .clone()
+                        .meta()
+                        .output_name()
+                        .map_err(PyPolarsErr::from)?
+                        .clone(),
+                    suffix: pair_suffix.map(|s| PlSmallStr::from_str(s.as_ref())),
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+
+        Ok(self
+            .ldf
+            .read()
+            .clone()
+            .join_asof_many(
+                other.ldf.into_inner(),
+                left_on,
+                right_on,
+                pairs,
+                AsOfOptions {
+                    strategy: strategy.0,
+                    left_by: left_by.map(strings_to_pl_smallstr),
+                    right_by: right_by.map(strings_to_pl_smallstr),
+                    tolerance: tolerance.map(|t| {
+                        let av = t.0.into_static();
+                        let dtype = av.dtype();
+                        Scalar::new(dtype, av)
+                    }),
+                    tolerance_str: tolerance_str.map(Into::into),
+                    allow_eq,
+                    check_sortedness,
+                },
+                allow_parallel,
+                force_parallel,
+                Some(suffix.into()),
+                coalesce,
+            )
+            .into())
+    }
+
     #[pyo3(signature = (function, predicate_pushdown, projection_pushdown, slice_pushdown, streamable, schema, validate_output))]
     fn map_batches(
         &self,
