@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "asof_join")]
+use polars_ops::frame::{AsofJoinPair, JoinCoalesce};
 
 #[cfg(feature = "parquet")]
 pub(crate) fn row_index_at_scan(q: LazyFrame) -> bool {
@@ -43,6 +45,19 @@ pub(crate) fn predicate_at_all_scans(q: LazyFrame) -> bool {
         IR::Scan {
             predicate: Some(_), ..
         } => true,
+        _ => false,
+    })
+}
+
+#[cfg(feature = "asof_join")]
+fn asof_many_join_has_slice(q: LazyFrame) -> bool {
+    let (mut expr_arena, mut lp_arena) = get_arenas();
+    let lp = q.optimize(&mut lp_arena, &mut expr_arena).unwrap();
+
+    lp_arena.iter(lp).any(|(_, lp)| match lp {
+        IR::Join { options, .. } => {
+            matches!(&options.args.how, JoinType::AsOfMany(_)) && options.args.slice.is_some()
+        },
         _ => false,
     })
 }
@@ -646,6 +661,177 @@ fn test_cluster_with_columns_chain() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(num_occurrences(&unoptimized, "WITH_COLUMNS"), 4);
     assert_eq!(num_occurrences(&optimized, "WITH_COLUMNS"), 1);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_join_asof_many_errors_on_mismatched_pair_count() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 3],
+        "ts_b" => [2i64, 4],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_a" => [1i64, 2, 4],
+        "rhs_b" => [2i64, 3, 5],
+        "payload" => [10i64, 20, 30],
+    )?
+    .lazy();
+
+    let err = left
+        .join_asof_many(
+            right,
+            vec![col("ts_a"), col("ts_b")],
+            vec![col("rhs_a"), col("rhs_b")],
+            vec![AsofJoinPair {
+                left_on_name: "ts_a".into(),
+                right_on_name: "rhs_a".into(),
+                suffix: Some("_a".into()),
+            }],
+            Default::default(),
+            true,
+            false,
+            Some("_right".into()),
+            JoinCoalesce::KeepColumns,
+        )
+        .collect()
+        .unwrap_err();
+
+    assert!(err
+        .to_string()
+        .contains("expected equal number of pairs and join keys in 'join_asof_many'"));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "asof_join", feature = "dtype-datetime"))]
+fn test_join_asof_many_tolerance_str_mixed_temporal_units_matches_chain() -> PolarsResult<()> {
+    let left = DataFrame::new(vec![
+        Series::new("ts_ms".into(), [1_000i64, 3_000])
+            .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
+            .into(),
+        Series::new("ts_us".into(), [1_000_000i64, 3_000_000])
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))?
+            .into(),
+    ])?
+    .lazy();
+    let right = DataFrame::new(vec![
+        Series::new("ts_ms".into(), [500i64, 2_500])
+            .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
+            .into(),
+        Series::new("ts_us".into(), [500_000i64, 2_500_000])
+            .cast(&DataType::Datetime(TimeUnit::Microseconds, None))?
+            .into(),
+        Series::new("payload".into(), [10i64, 20]).into(),
+    ])?
+    .lazy();
+
+    let options = AsOfOptions {
+        tolerance_str: Some("750ms".into()),
+        ..Default::default()
+    };
+
+    let result = left
+        .clone()
+        .join_asof_many(
+            right.clone(),
+            vec![col("ts_ms"), col("ts_us")],
+            vec![col("ts_ms"), col("ts_us")],
+            vec![
+                AsofJoinPair {
+                    left_on_name: "ts_ms".into(),
+                    right_on_name: "ts_ms".into(),
+                    suffix: Some("_ms".into()),
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_us".into(),
+                    right_on_name: "ts_us".into(),
+                    suffix: Some("_us".into()),
+                },
+            ],
+            options.clone(),
+            true,
+            false,
+            Some("_right".into()),
+            JoinCoalesce::KeepColumns,
+        )
+        .collect()?;
+
+    let expected = left
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("ts_ms")])
+        .right_on([col("ts_ms")])
+        .how(JoinType::AsOf(Box::new(AsOfOptions {
+            tolerance_str: Some("750ms".into()),
+            ..Default::default()
+        })))
+        .suffix("_ms")
+        .coalesce(JoinCoalesce::KeepColumns)
+        .finish()
+        .join_builder()
+        .with(right)
+        .left_on([col("ts_us")])
+        .right_on([col("ts_us")])
+        .how(JoinType::AsOf(Box::new(options)))
+        .suffix("_us")
+        .coalesce(JoinCoalesce::KeepColumns)
+        .finish()
+        .collect()?;
+
+    assert!(result.equals_missing(&expected));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_join_asof_many_blocks_slice_pushdown() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 3, 5],
+        "ts_b" => [2i64, 4, 6],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_ts" => [1i64, 2, 4, 7],
+        "v" => [10i64, 20, 40, 70],
+    )?
+    .lazy();
+
+    let q = left
+        .join_asof_many(
+            right,
+            vec![col("ts_a"), col("ts_b")],
+            vec![col("rhs_ts"), col("rhs_ts")],
+            vec![
+                AsofJoinPair {
+                    left_on_name: "ts_a".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_a".into()),
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_b".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_b".into()),
+                },
+            ],
+            Default::default(),
+            true,
+            false,
+            Some("_right".into()),
+            JoinCoalesce::KeepColumns,
+        )
+        .slice(0, 1);
+
+    assert!(!asof_many_join_has_slice(q.clone()));
+
+    let optimized = q.clone().collect()?;
+    let unoptimized = q.without_optimizations().collect()?;
+
+    assert!(optimized.equals_missing(&unoptimized));
 
     Ok(())
 }
