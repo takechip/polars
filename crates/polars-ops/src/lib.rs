@@ -9,5 +9,11 @@ pub mod chunked_array;
 #[cfg(feature = "pivot")]
 pub use frame::unpivot;
 pub mod frame;
+#[cfg(feature = "asof_join")]
+#[doc(hidden)]
+pub mod internal {
+    pub use crate::frame::join::materialize_asof_tolerance;
+    pub use crate::frame::join::asof_many_unstable::{AsOfManyOptions, validate_asof_many_options};
+}
 pub mod prelude;
 pub mod series;

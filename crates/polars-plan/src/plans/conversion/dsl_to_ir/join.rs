@@ -2,10 +2,11 @@ use arrow::legacy::error::PolarsResult;
 use either::Either;
 use polars_core::chunked_array::cast::CastOptions;
 use polars_core::error::feature_gated;
-use polars_core::utils::arrow::temporal_conversions::MILLISECONDS_IN_DAY;
 use polars_core::utils::{get_numeric_upcast_supertype_lossless, try_get_supertype};
 #[cfg(feature = "asof_join")]
-use polars_ops::frame::validate_asof_many_options;
+use polars_ops::internal::validate_asof_many_options;
+#[cfg(feature = "asof_join")]
+use polars_ops::internal::materialize_asof_tolerance;
 use polars_utils::format_pl_smallstr;
 use polars_utils::itertools::Itertools;
 
@@ -25,42 +26,6 @@ fn check_join_keys(keys: &[Expr]) -> PolarsResult<()> {
         }
     }
     Ok(())
-}
-
-#[cfg(feature = "asof_join")]
-fn materialize_asof_tolerance(
-    dtype: &DataType,
-    tolerance: Option<&Scalar>,
-    tolerance_str: Option<&str>,
-) -> PolarsResult<Option<Scalar>> {
-    let Some(tolerance_str) = tolerance_str else {
-        return Ok(tolerance.cloned());
-    };
-
-    let duration = polars_time::Duration::try_parse(tolerance_str)?;
-    polars_ensure!(
-        duration.months() == 0,
-        ComputeError: "cannot use month offset in timedelta of an asof join; consider using 4 weeks"
-    );
-
-    use DataType::*;
-    let tolerance = match dtype {
-        Datetime(tu, _) | Duration(tu) => match tu {
-            TimeUnit::Nanoseconds => Scalar::from(duration.duration_ns()),
-            TimeUnit::Microseconds => Scalar::from(duration.duration_us()),
-            TimeUnit::Milliseconds => Scalar::from(duration.duration_ms()),
-        },
-        Date => Scalar::from((duration.duration_ms() / MILLISECONDS_IN_DAY) as i32),
-        Time => Scalar::from(duration.duration_ns()),
-        _ => {
-            polars_bail!(
-                InvalidOperation:
-                "can only use timedelta string language with Date/Datetime/Duration/Time dtypes"
-            )
-        },
-    };
-
-    Ok(Some(tolerance))
 }
 
 /// Returns: left: join_node, right: last_node (often both the same)
@@ -388,45 +353,18 @@ pub fn resolve_join(
 
     #[cfg(feature = "asof_join")]
     if let JoinType::AsOf(options) = &mut options.args.how {
-        use polars_core::utils::arrow::temporal_conversions::MILLISECONDS_IN_DAY;
-
         // prepare the tolerance
         // we must ensure that we use the right units
-        if let Some(tol) = &options.tolerance_str {
-            let duration = polars_time::Duration::try_parse(tol)?;
-            polars_ensure!(
-                duration.months() == 0,
-                ComputeError: "cannot use month offset in timedelta of an asof join; \
-                consider using 4 weeks"
-            );
-            use DataType::*;
-            match ctxt
+        if options.tolerance_str.is_some() {
+            let dtype = ctxt
                 .expr_arena
                 .get(left_on[0].node())
-                .to_dtype(&ToFieldContext::new(ctxt.expr_arena, &schema_left))?
-            {
-                Datetime(tu, _) | Duration(tu) => {
-                    let tolerance = match tu {
-                        TimeUnit::Nanoseconds => duration.duration_ns(),
-                        TimeUnit::Microseconds => duration.duration_us(),
-                        TimeUnit::Milliseconds => duration.duration_ms(),
-                    };
-                    options.tolerance = Some(Scalar::from(tolerance))
-                },
-                Date => {
-                    let days = (duration.duration_ms() / MILLISECONDS_IN_DAY) as i32;
-                    options.tolerance = Some(Scalar::from(days))
-                },
-                Time => {
-                    let tolerance = duration.duration_ns();
-                    options.tolerance = Some(Scalar::from(tolerance))
-                },
-                _ => {
-                    panic!(
-                        "can only use timedelta string language with Date/Datetime/Duration/Time dtypes"
-                    )
-                },
-            }
+                .to_dtype(&ToFieldContext::new(ctxt.expr_arena, &schema_left))?;
+            options.tolerance = materialize_asof_tolerance(
+                &dtype,
+                options.tolerance.as_ref(),
+                options.tolerance_str.as_deref(),
+            )?;
         }
     } else if let JoinType::AsOfMany(options) = &mut options.args.how {
         if options.options.tolerance_str.is_some() {

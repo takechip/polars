@@ -181,7 +181,8 @@ mod test {
     use arrow::array::PrimitiveArray;
 
     use super::*;
-    use crate::frame::join::{AsOfManyOptions, AsOfOptions, AsofJoinPair, DataFrameJoinOps, JoinArgs, JoinType};
+    use crate::frame::join::{AsOfOptions, AsofJoinPair, DataFrameJoinOps, JoinArgs, JoinType};
+    use crate::internal::AsOfManyOptions;
 
     #[test]
     fn test_asof_backward() {
@@ -507,6 +508,83 @@ mod test {
             "row" => ["r1", "r2", "r3"],
             "value" => [80i64, 140, 230],
             "value_us" => [Some(80i64), None, None],
+        )?;
+
+        let fused = fused.select(["row", "value", "value_us"])?;
+        assert!(fused.equals_missing(&expected));
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "dtype-datetime", feature = "dtype-duration"))]
+    fn test_asof_many_eager_tolerance_str_accepts_mixed_fixed_units() -> PolarsResult<()> {
+        let mut left = df!(
+            "row" => ["r1", "r2", "r3"],
+            "ts_ms" => [10i64, 16, 25],
+            "ts_us" => [10_000i64, 16_000, 25_000],
+        )?;
+        left.with_column(
+            left.column("ts_ms")?
+                .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
+                .into_column(),
+        )?;
+        left.with_column(
+            left.column("ts_us")?
+                .cast(&DataType::Duration(TimeUnit::Microseconds))?
+                .into_column(),
+        )?;
+
+        let mut right = df!(
+            "rhs_ms" => [8i64, 14, 23],
+            "rhs_us" => [8_000i64, 12_000, 20_000],
+            "value" => [80i64, 140, 230],
+        )?;
+        right.with_column(
+            right
+                .column("rhs_ms")?
+                .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
+                .into_column(),
+        )?;
+        right.with_column(
+            right
+                .column("rhs_us")?
+                .cast(&DataType::Duration(TimeUnit::Microseconds))?
+                .into_column(),
+        )?;
+
+        let options = AsOfOptions {
+            tolerance_str: Some("1w2d3ms".into()),
+            ..Default::default()
+        };
+
+        let fused = left.join(
+            &right,
+            ["ts_ms", "ts_us"],
+            ["rhs_ms", "rhs_us"],
+            JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                options,
+                pairs: vec![
+                    AsofJoinPair {
+                        left_on_name: "ts_ms".into(),
+                        right_on_name: "rhs_ms".into(),
+                        suffix: Some("_ms".into()),
+                    },
+                    AsofJoinPair {
+                        left_on_name: "ts_us".into(),
+                        right_on_name: "rhs_us".into(),
+                        suffix: Some("_us".into()),
+                    },
+                ],
+                pair_tolerances: None,
+            }))),
+            None,
+        )?;
+
+        let expected = df!(
+            "row" => ["r1", "r2", "r3"],
+            "value" => [80i64, 140, 230],
+            "value_us" => [Some(80i64), Some(140i64), Some(230i64)],
         )?;
 
         let fused = fused.select(["row", "value", "value_us"])?;

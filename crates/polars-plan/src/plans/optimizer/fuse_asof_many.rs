@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use polars_core::prelude::{PolarsResult, Scalar};
 use polars_error::polars_bail;
-use polars_ops::frame::{AsOfManyOptions, AsOfOptions, AsofJoinPair};
+use polars_ops::frame::{AsOfOptions, AsofJoinPair};
+use polars_ops::internal::AsOfManyOptions;
 use polars_utils::pl_str::PlSmallStr;
 
 use crate::plans::aexpr::AExpr;
@@ -152,12 +153,16 @@ impl OptimizationRule for FuseAsofMany {
         node: Node,
     ) -> PolarsResult<Option<IR>> {
         let unwrap_simple_select =
-            |mut node: Node, lp_arena: &Arena<IR>, expr_arena: &Arena<AExpr>| {
+            |mut node: Node,
+             lp_arena: &Arena<IR>,
+             expr_arena: &Arena<AExpr>,
+             unwrap_simple_projection: bool| {
                 loop {
                     match lp_arena.get(node) {
                         IR::Select { input, expr, .. } => {
-                            let is_simple = expr.iter().all(|expr_ir| {
-                                matches!(expr_arena.get(expr_ir.node()), AExpr::Column(_))
+                            let is_simple = expr.iter().all(|expr_ir| match expr_arena.get(expr_ir.node()) {
+                                AExpr::Column(name) => expr_ir.output_name() == name,
+                                _ => false,
                             });
 
                             if !is_simple {
@@ -166,7 +171,7 @@ impl OptimizationRule for FuseAsofMany {
 
                             node = *input;
                         },
-                        IR::SimpleProjection { input, .. } => {
+                        IR::SimpleProjection { input, .. } if unwrap_simple_projection => {
                             node = *input;
                         },
                         _ => break,
@@ -227,8 +232,8 @@ impl OptimizationRule for FuseAsofMany {
             _ => return Ok(None),
         };
 
-        let prev_input_node = unwrap_simple_select(input_left, lp_arena, expr_arena);
-        let fused_right_input = unwrap_simple_select(input_right, lp_arena, expr_arena);
+        let prev_input_node = unwrap_simple_select(input_left, lp_arena, expr_arena, true);
+        let fused_right_input = unwrap_simple_select(input_right, lp_arena, expr_arena, false);
 
         let IR::Join {
             input_left: previous_left,
@@ -242,7 +247,8 @@ impl OptimizationRule for FuseAsofMany {
             return Ok(None);
         };
 
-        let previous_right_input = unwrap_simple_select(*previous_right, lp_arena, expr_arena);
+        let previous_right_input =
+            unwrap_simple_select(*previous_right, lp_arena, expr_arena, false);
 
         let (original_left, prev_pairs) = match &prev_options.args.how {
             JoinType::AsOf(_prev_asof) => {

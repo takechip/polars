@@ -8224,6 +8224,8 @@ class DataFrame:
         computed against the same ``other`` frame in pair order.
 
         Parameters are the same as :meth:`LazyFrame.join_asof_many`.
+        In particular, ``check_sortedness=True`` only fully checks sortedness when no
+        ``by`` groups are provided; otherwise Polars can only emit a warning.
 
         This functionality is experimental. It may be changed at any point without it
         being considered a breaking change.

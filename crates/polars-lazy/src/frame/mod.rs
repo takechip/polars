@@ -32,7 +32,9 @@ use polars_mem_engine::scan_predicate::functions::apply_scan_predicate_to_scan_i
 use polars_mem_engine::{Executor, create_multiple_physical_plans, create_physical_plan};
 use polars_ops::frame::{JoinBuildSide, JoinCoalesce, MaintainOrderJoin};
 #[cfg(feature = "asof_join")]
-use polars_ops::prelude::{AsOfManyOptions, AsOfOptions, AsofJoinPair, JoinType};
+use polars_ops::internal::AsOfManyOptions;
+#[cfg(feature = "asof_join")]
+use polars_ops::prelude::{AsOfOptions, AsofJoinPair, JoinType};
 #[cfg(feature = "is_between")]
 use polars_ops::prelude::ClosedInterval;
 pub use polars_plan::frame::{AllowedOptimizations, OptFlags};

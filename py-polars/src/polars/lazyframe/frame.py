@@ -6253,11 +6253,14 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         coalesce
             Whether to coalesce join columns.
         tolerance
-            Numeric or temporal tolerance, following ``join_asof`` semantics. If this
-            is provided as a string duration, it is interpreted separately for each
-            pair using that pair's left key dtype.
+            Numeric or temporal tolerance. If this is provided as a string duration,
+            ``join_asof_many`` currently parses it as a fixed-duration string for each
+            pair using that pair's left key dtype; calendar units such as ``mo``,
+            ``q``, and ``y`` are not supported.
         check_sortedness
-            Check the sortedness of the asof keys.
+            Check the sortedness of the asof keys. If the keys are not sorted Polars
+            will error. Currently, when 'by' groups are provided Polars cannot check
+            sortedness and only emits a warning.
 
         Notes
         -----

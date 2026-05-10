@@ -19,9 +19,16 @@ pub use args::*;
 use arrow::trusted_len::TrustedLen;
 #[cfg(feature = "asof_join")]
 pub use asof::{
-    _check_asof_columns, _join_asof_dispatch, AsOfManyOptions, AsOfOptions, AsofJoin, AsofJoinBy,
-    AsofJoinPair, AsofStrategy, validate_asof_many_options,
+    _check_asof_columns, _join_asof_dispatch, materialize_asof_tolerance, AsOfOptions, AsofJoin, AsofJoinBy,
+    AsofJoinPair, AsofStrategy,
 };
+#[cfg(feature = "asof_join")]
+pub(crate) use asof::validate_asof_many_options;
+#[cfg(feature = "asof_join")]
+#[doc(hidden)]
+pub mod asof_many_unstable {
+    pub use super::asof::{AsOfManyOptions, validate_asof_many_options};
+}
 pub use cross_join::CrossJoin;
 #[cfg(feature = "chunked_ids")]
 use either::Either;

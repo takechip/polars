@@ -118,7 +118,7 @@ fn parse_fixed_duration_ns(duration: &str) -> PolarsResult<i64> {
     Ok(if negative { -total_ns } else { total_ns })
 }
 
-pub(super) fn materialize_asof_tolerance(
+pub fn materialize_asof_tolerance(
     dtype: &DataType,
     tolerance: Option<&Scalar>,
     tolerance_str: Option<&str>,

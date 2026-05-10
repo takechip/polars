@@ -21,6 +21,7 @@ use crate::dsl::PartitionedSinkOptions;
 use crate::dsl::file_provider::{FileProviderType, HivePathProvider};
 use crate::dsl::functions::{all_horizontal, col};
 use crate::plans::conversion::dsl_to_ir::scans::SourcesToFileInfo;
+use crate::plans::schema::validate_arrow_schema_conversion;
 
 mod concat;
 mod datatype_fn_to_ir;
