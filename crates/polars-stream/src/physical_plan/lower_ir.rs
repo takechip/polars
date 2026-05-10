@@ -4,16 +4,16 @@ use arrow::array::{MutableBinaryViewArray, Utf8ViewArray};
 use arrow::datatypes::ArrowDataType;
 use parking_lot::Mutex;
 use polars_core::frame::{DataFrame, UniqueKeepStrategy};
-use polars_core::prelude::{DataType, IntoColumn, PlHashMap, PlHashSet};
+use polars_core::prelude::{DataType, IntoColumn, PlHashMap, PlHashSet, PlIndexSet, SchemaExt};
 use polars_core::scalar::Scalar;
-use polars_core::schema::Schema;
+use polars_core::schema::{Schema, SchemaRef};
 use polars_core::series::Series;
 use polars_core::{ALLOW_RAYON_THREADS, SchemaExtPl, config};
-use polars_error::{PolarsResult, polars_ensure};
+use polars_error::{PolarsError, PolarsResult, polars_ensure, polars_err};
 use polars_expr::dispatch::function_expr_to_udf;
 use polars_expr::state::ExecutionState;
 use polars_mem_engine::create_physical_plan;
-use polars_ops::frame::JoinType;
+use polars_ops::frame::{JoinArgs, JoinType, validate_asof_many_options};
 use polars_plan::constants::get_literal_name;
 use polars_plan::dsl::default_values::DefaultFieldValues;
 use polars_plan::dsl::deletion::DeletionFilesList;
@@ -42,6 +42,73 @@ use crate::physical_plan::ZipBehavior;
 use crate::physical_plan::lower_expr::{ExprCache, build_select_stream, lower_exprs};
 use crate::physical_plan::lower_group_by::build_group_by_stream;
 use crate::utils::late_materialized_df::LateMaterializedDataFrame;
+
+#[cfg(feature = "asof_join")]
+fn det_asof_join_schema(
+    schema_left: &SchemaRef,
+    schema_right: &SchemaRef,
+    left_on: &ExprIR,
+    right_on: &ExprIR,
+    options: &JoinOptionsIR,
+    expr_arena: &Arena<AExpr>,
+) -> PolarsResult<SchemaRef> {
+    let JoinType::AsOf(asof_options) = &options.args.how else {
+        unreachable!()
+    };
+
+    let mut new_schema = Schema::with_capacity(schema_left.len() + schema_right.len())
+        .hstack(schema_left.iter_fields())?;
+    let is_coalesced = options.args.should_coalesce();
+    let left_field = left_on.field(schema_left, expr_arena)?;
+    let right_field = right_on.field(schema_right, expr_arena)?;
+    let mut right_by: PlHashSet<&PlSmallStr> = PlHashSet::default();
+
+    if let Some(v) = &asof_options.right_by {
+        right_by.extend(v.iter());
+    }
+
+    for (name, dtype) in schema_right.iter() {
+        // Asof join by columns are coalesced.
+        if right_by.contains(name) {
+            continue;
+        }
+
+        if is_coalesced && name == &right_field.name && left_field.name == *name {
+            continue;
+        }
+
+        let mut suffixed = None;
+        let (name, dtype) = if schema_left.contains(name) {
+            suffixed = Some(format_pl_smallstr!("{}{}", name, options.args.suffix()));
+            (suffixed.clone().unwrap(), dtype.clone())
+        } else {
+            (name.clone(), dtype.clone())
+        };
+
+        new_schema.try_insert(name, dtype).map_err(|e| {
+            if let Some(column) = suffixed {
+                join_suffix_duplicate_help_msg(&column)
+            } else {
+                e
+            }
+        })?;
+    }
+
+    Ok(Arc::new(new_schema))
+}
+
+#[cfg(feature = "asof_join")]
+fn join_suffix_duplicate_help_msg(column_name: &str) -> PolarsError {
+    polars_err!(
+        Duplicate:
+        "\
+column with name '{column_name}' already exists
+
+You may want to try:
+- renaming the column prior to joining
+- using the `suffix` parameter to specify a suffix different to the default one ('_right')"
+    )
+}
 
 /// Creates a new PhysStream which outputs a slice of the input stream.
 pub fn build_slice_stream(
@@ -1023,6 +1090,7 @@ pub fn lower_ir(
             #[cfg(feature = "iejoin")]
             const RANGE_JOIN_PREFER_DESCENDING: bool = false;
 
+            let join_options = options.as_ref().clone();
             #[allow(unused_mut)]
             let (mut input_left, mut input_right) = (*input_left, *input_right);
             let input_left_schema = IR::schema_with_cache(input_left, ir_arena, schema_cache);
@@ -1034,8 +1102,79 @@ pub fn lower_ir(
             let right_on_names = right_on.iter().map(get_expr_name).collect_vec();
             let mut tmp_left_col_names: Vec<Option<PlSmallStr>> = Vec::new();
             let mut tmp_right_col_names: Vec<Option<PlSmallStr>> = Vec::new();
-            let args = options.args.clone();
-            let options = options.options.clone();
+
+            #[cfg(feature = "asof_join")]
+            if let JoinType::AsOfMany(asof_many_options) = &join_options.args.how {
+                validate_asof_many_options(asof_many_options, &left_on_names, &right_on_names)?;
+
+                let mut current_left = input_left;
+                let mut current_left_schema = input_left_schema.clone();
+                let slice = join_options.args.slice;
+
+                for (idx, ((left_expr, right_expr), pair)) in left_on
+                    .iter()
+                    .cloned()
+                    .zip(right_on.iter().cloned())
+                    .zip(asof_many_options.pairs.iter())
+                    .enumerate()
+                {
+                    let mut pair_asof_options = asof_many_options.options.clone();
+                    pair_asof_options.tolerance = asof_many_options
+                        .pair_tolerances
+                        .as_ref()
+                        .map(|pair_tolerances| pair_tolerances[idx].clone())
+                        .or_else(|| pair_asof_options.tolerance.clone());
+                    let pair_options = JoinOptionsIR {
+                        allow_parallel: join_options.allow_parallel,
+                        force_parallel: join_options.force_parallel,
+                        args: JoinArgs {
+                            how: JoinType::AsOf(Box::new(pair_asof_options)),
+                            validation: join_options.args.validation,
+                            suffix: pair
+                                .suffix
+                                .clone()
+                                .or_else(|| join_options.args.suffix.clone()),
+                            slice: None,
+                            nulls_equal: join_options.args.nulls_equal,
+                            coalesce: join_options.args.coalesce,
+                            maintain_order: join_options.args.maintain_order,
+                            build_side: join_options.args.build_side.clone(),
+                        },
+                        options: join_options.options.clone(),
+                    };
+                    let pair_schema = det_asof_join_schema(
+                        &current_left_schema,
+                        &input_right_schema,
+                        &left_expr,
+                        &right_expr,
+                        &pair_options,
+                        expr_arena,
+                    )?;
+
+                    current_left = ir_arena.add(IR::Join {
+                        input_left: current_left,
+                        input_right,
+                        schema: pair_schema.clone(),
+                        left_on: vec![left_expr],
+                        right_on: vec![right_expr],
+                        options: Arc::new(pair_options),
+                    });
+                    current_left_schema = pair_schema;
+                }
+
+                if let Some((offset, len)) = slice {
+                    current_left = ir_arena.add(IR::Slice {
+                        input: current_left,
+                        offset,
+                        len: len as IdxSize,
+                    });
+                }
+
+                return lower_ir!(current_left);
+            }
+
+            let args = join_options.args.clone();
+            let options = join_options.options.clone();
             #[cfg(feature = "asof_join")]
             let asof_options = || match args.how {
                 JoinType::AsOf(ref asof_options) => asof_options,

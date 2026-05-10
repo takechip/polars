@@ -7,6 +7,7 @@ import pyarrow.dataset as pad
 import pytest
 
 import polars as pl
+from polars.lazyframe.opt_flags import QueryOptFlags
 from polars.testing import assert_frame_equal
 
 
@@ -303,6 +304,43 @@ def test_fuse_join_asof_many_chain() -> None:
     )
 
     plan = q.explain()
+    assert plan.count("ASOF MANY JOIN:") == 1
+
+
+def test_fuse_join_asof_many_chain_streaming() -> None:
+    left = pl.LazyFrame(
+        {"ts_a": [1, 3, 5], "ts_b": [2, 4, 6], "keep": [7, 8, 9], "v": [-1, -1, -1]}
+    )
+    right = pl.LazyFrame({"rhs_ts": [1, 2, 4, 7], "v": [10, 20, 40, 70], "drop": [0, 0, 0, 0]})
+
+    q = (
+        left.join_asof(right, left_on="ts_a", right_on="rhs_ts", suffix="_a")
+        .join_asof(right, left_on="ts_b", right_on="rhs_ts", suffix="_b")
+        .select("keep", "v_a")
+    )
+
+    plan = q.explain()
+    assert plan.count("ASOF MANY JOIN:") == 1
+
+    dot = q.show_graph(engine="streaming", plan_stage="physical", raw_output=True)
+    assert "in-memory-join" not in dot
+    assert "asof-join" in dot
+    assert_frame_equal(q.collect(), q.collect(engine="streaming"))
+
+
+def test_fuse_join_asof_many_chain_eager_optimizations() -> None:
+    left = pl.LazyFrame(
+        {"ts_a": [1, 3, 5], "ts_b": [2, 4, 6], "keep": [7, 8, 9], "v": [-1, -1, -1]}
+    )
+    right = pl.LazyFrame({"rhs_ts": [1, 2, 4, 7], "v": [10, 20, 40, 70]})
+
+    q = (
+        left.join_asof(right, left_on="ts_a", right_on="rhs_ts", suffix="_a")
+        .join_asof(right, left_on="ts_b", right_on="rhs_ts", suffix="_b")
+        .select("keep", "v_a")
+    )
+
+    plan = q.explain(optimizations=QueryOptFlags._eager())
     assert plan.count("ASOF MANY JOIN:") == 1
 
 

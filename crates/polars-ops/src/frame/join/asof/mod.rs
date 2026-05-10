@@ -6,6 +6,8 @@ use std::cmp::Ordering;
 use default::*;
 pub use groups::AsofJoinBy;
 use polars_core::prelude::*;
+use polars_core::utils::arrow::temporal_conversions::MILLISECONDS_IN_DAY;
+use polars_error::polars_ensure;
 use polars_utils::pl_str::PlSmallStr;
 use polars_utils::total_ord::TotalOrd;
 #[cfg(feature = "serde")]
@@ -14,6 +16,138 @@ use serde::{Deserialize, Serialize};
 use super::{_finish_join, build_tables};
 use crate::frame::IntoDf;
 use crate::series::SeriesMethods;
+
+fn parse_fixed_duration_ns(duration: &str) -> PolarsResult<i64> {
+    const NS_PER_US: i64 = 1_000;
+    const NS_PER_MS: i64 = 1_000_000;
+    const NS_PER_S: i64 = 1_000_000_000;
+    const NS_PER_M: i64 = 60 * NS_PER_S;
+    const NS_PER_H: i64 = 60 * NS_PER_M;
+    const NS_PER_D: i64 = 24 * NS_PER_H;
+    const NS_PER_W: i64 = 7 * NS_PER_D;
+
+    if duration.is_empty() {
+        polars_bail!(InvalidOperation: "expected a valid duration string, found empty string")
+    }
+
+    let bytes = duration.as_bytes();
+    let mut pos = 0usize;
+    let negative = matches!(bytes.first(), Some(b'-'));
+    if negative || matches!(bytes.first(), Some(b'+')) {
+        pos += 1;
+    }
+
+    let mut total_ns = 0i64;
+    let mut parsed_any = false;
+
+    while pos < bytes.len() {
+        polars_ensure!(
+            bytes[pos].is_ascii_digit(),
+            InvalidOperation:
+                "expected leading integer in the duration string, found '{}'",
+                bytes[pos] as char
+        );
+
+        let start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        polars_ensure!(
+            pos < bytes.len(),
+            InvalidOperation:
+                "expected a valid unit to follow integer in the duration string '{}'",
+                duration
+        );
+
+        let value = duration[start..pos].parse::<i64>().map_err(|_| {
+            polars_err!(InvalidOperation: "integer value in duration string '{}' overflows i64", duration)
+        })?;
+
+        let remaining = &duration[pos..];
+        let (unit, factor_ns, is_month_unit) = if remaining.starts_with("ns") {
+            ("ns", 1i64, false)
+        } else if remaining.starts_with("us") {
+            ("us", NS_PER_US, false)
+        } else if remaining.starts_with("ms") {
+            ("ms", NS_PER_MS, false)
+        } else if remaining.starts_with("mo") {
+            ("mo", 0, true)
+        } else if remaining.starts_with('s') {
+            ("s", NS_PER_S, false)
+        } else if remaining.starts_with('m') {
+            ("m", NS_PER_M, false)
+        } else if remaining.starts_with('h') {
+            ("h", NS_PER_H, false)
+        } else if remaining.starts_with('d') {
+            ("d", NS_PER_D, false)
+        } else if remaining.starts_with('w') {
+            ("w", NS_PER_W, false)
+        } else if remaining.starts_with('q') {
+            ("q", 0, true)
+        } else if remaining.starts_with('y') {
+            ("y", 0, true)
+        } else {
+            polars_bail!(
+                InvalidOperation:
+                    "expected a valid unit to follow integer in the duration string '{}'",
+                    duration
+            )
+        };
+
+        if is_month_unit {
+            polars_bail!(
+                ComputeError: "cannot use month offset in timedelta of an asof join; consider using 4 weeks"
+            )
+        }
+
+        total_ns = total_ns
+            .checked_add(value.checked_mul(factor_ns).ok_or_else(|| {
+                polars_err!(InvalidOperation: "duration string '{}' overflows i64", duration)
+            })?)
+            .ok_or_else(|| polars_err!(InvalidOperation: "duration string '{}' overflows i64", duration))?;
+        pos += unit.len();
+        parsed_any = true;
+    }
+
+    polars_ensure!(
+        parsed_any,
+        InvalidOperation: "expected a valid duration string, found '{}'",
+        duration
+    );
+
+    Ok(if negative { -total_ns } else { total_ns })
+}
+
+pub(super) fn materialize_asof_tolerance(
+    dtype: &DataType,
+    tolerance: Option<&Scalar>,
+    tolerance_str: Option<&str>,
+) -> PolarsResult<Option<Scalar>> {
+    let Some(tolerance_str) = tolerance_str else {
+        return Ok(tolerance.cloned());
+    };
+
+    let duration_ns = parse_fixed_duration_ns(tolerance_str)?;
+
+    use DataType::*;
+    let tolerance = match dtype {
+        Datetime(tu, _) | Duration(tu) => match tu {
+            TimeUnit::Nanoseconds => Scalar::from(duration_ns),
+            TimeUnit::Microseconds => Scalar::from(duration_ns / 1_000),
+            TimeUnit::Milliseconds => Scalar::from(duration_ns / 1_000_000),
+        },
+        Date => Scalar::from(((duration_ns / 1_000_000) / MILLISECONDS_IN_DAY) as i32),
+        Time => Scalar::from(duration_ns),
+        _ => {
+            polars_bail!(
+                InvalidOperation:
+                "can only use timedelta string language with Date/Datetime/Duration/Time dtypes"
+            )
+        },
+    };
+
+    Ok(Some(tolerance))
+}
 
 #[inline]
 fn ge_allow_eq<T: TotalOrd>(l: &T, r: &T, allow_eq: bool) -> bool {
@@ -221,6 +355,8 @@ pub struct AsOfOptions {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
+/// This functionality is unstable. It may be changed at any point without it
+/// being considered a breaking change.
 pub struct AsofJoinPair {
     pub left_on_name: PlSmallStr,
     pub right_on_name: PlSmallStr,
@@ -230,9 +366,57 @@ pub struct AsofJoinPair {
 #[derive(Clone, Debug, PartialEq, Default, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "dsl-schema", derive(schemars::JsonSchema))]
+/// This functionality is unstable. It may be changed at any point without it
+/// being considered a breaking change.
 pub struct AsOfManyOptions {
     pub options: AsOfOptions,
     pub pairs: Vec<AsofJoinPair>,
+    pub pair_tolerances: Option<Vec<Scalar>>,
+}
+
+pub fn validate_asof_many_options(
+    options: &AsOfManyOptions,
+    left_on_names: &[PlSmallStr],
+    right_on_names: &[PlSmallStr],
+) -> PolarsResult<()> {
+    polars_ensure!(
+        !options.pairs.is_empty(),
+        InvalidOperation: "expected at least one pair in 'join_asof_many'"
+    );
+    polars_ensure!(
+        left_on_names.len() == right_on_names.len() && left_on_names.len() == options.pairs.len(),
+        ComputeError:
+            "invalid AsOfManyOptions: expected {} join keys on both sides, got {} left keys and {} right keys",
+            options.pairs.len(), left_on_names.len(), right_on_names.len()
+    );
+    if let Some(pair_tolerances) = &options.pair_tolerances {
+        polars_ensure!(
+            pair_tolerances.len() == options.pairs.len(),
+            ComputeError:
+                "invalid AsOfManyOptions: expected {} pair tolerances, got {}",
+                options.pairs.len(), pair_tolerances.len()
+        );
+    }
+
+    for (idx, ((left_on_name, right_on_name), pair)) in left_on_names
+        .iter()
+        .zip(right_on_names)
+        .zip(options.pairs.iter())
+        .enumerate()
+    {
+        polars_ensure!(
+            left_on_name == &pair.left_on_name && right_on_name == &pair.right_on_name,
+            ComputeError:
+                "invalid AsOfManyOptions: pair metadata at index {} does not match join keys (expected left='{}', right='{}'; got left='{}', right='{}')",
+                idx,
+                left_on_name,
+                right_on_name,
+                pair.left_on_name,
+                pair.right_on_name
+        );
+    }
+
+    Ok(())
 }
 
 pub fn _check_asof_columns(

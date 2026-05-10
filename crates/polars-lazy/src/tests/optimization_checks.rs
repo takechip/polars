@@ -1,3 +1,10 @@
+#[cfg(feature = "asof_join")]
+use polars_ops::{frame::{AsOfManyOptions, AsofJoinPair}, prelude::AsOfOptions};
+#[cfg(feature = "asof_join")]
+use polars_core::prelude::Scalar;
+#[cfg(feature = "asof_join")]
+use polars_ops::prelude::JoinCoalesce;
+
 use super::*;
 
 #[cfg(feature = "parquet")]
@@ -691,6 +698,714 @@ fn test_fuse_join_asof_many_chain_rust() -> PolarsResult<()> {
     let plan = q.describe_optimized_plan()?;
     assert_eq!(num_occurrences(&plan, "ASOF MANY JOIN:"), 1);
     assert_eq!(num_occurrences(&plan, "ASOF JOIN:"), 0);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_fuse_join_asof_many_projection_pushdown_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 3, 5],
+        "ts_b" => [2i64, 4, 6],
+        "keep" => [7i64, 8, 9],
+        "v" => [-1i64, -1, -1],
+        "drop_left" => [0i64, 0, 0],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_ts" => [1i64, 2, 4, 7],
+        "v" => [10i64, 20, 40, 70],
+        "drop_right" => [5i64, 5, 5, 5],
+    )?
+    .lazy();
+
+    let optimized = left
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("ts_a")])
+        .right_on([col("rhs_ts")])
+        .how(JoinType::AsOf(Box::default()))
+        .suffix("_a")
+        .finish()
+        .join_builder()
+        .with(right)
+        .left_on([col("ts_b")])
+        .right_on([col("rhs_ts")])
+        .how(JoinType::AsOf(Box::default()))
+        .suffix("_b")
+        .finish()
+        .select([col("keep"), col("v_a")])
+        .to_alp_optimized()?;
+
+    let node = optimized.lp_top;
+    let lp_arena = optimized.lp_arena;
+
+    let mut asof_many_count = 0;
+    assert!(lp_arena.iter(node).all(|(_, lp)| match lp {
+        IR::Join { options, .. } => {
+            if matches!(options.args.how, JoinType::AsOfMany(_)) {
+                asof_many_count += 1;
+            }
+            true
+        },
+        IR::DataFrameScan {
+            schema,
+            output_schema,
+            ..
+        } => {
+            let projected = output_schema.as_ref().unwrap();
+            if schema.contains("drop_left") {
+                assert_eq!(projected.len(), 3);
+                assert!(projected.contains("ts_a"));
+                assert!(projected.contains("ts_b"));
+                assert!(projected.contains("keep"));
+            }
+            if schema.contains("drop_right") {
+                assert_eq!(projected.len(), 2);
+                assert!(projected.contains("rhs_ts"));
+                assert!(projected.contains("v"));
+            }
+            true
+        },
+        _ => true,
+    }));
+
+    assert_eq!(asof_many_count, 1);
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_fuse_join_asof_many_equivalent_right_inputs_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 3, 5],
+        "ts_b" => [2i64, 4, 6],
+    )?
+    .lazy();
+    let base_right = df!(
+        "rhs_ts" => [1i64, 2, 4, 7],
+        "v" => [10i64, 20, 40, 70],
+    )?
+    .lazy();
+
+    let right_a = base_right.clone().select([col("rhs_ts"), col("v")]);
+    let right_b = base_right.select([col("rhs_ts"), col("v")]);
+
+    let q = left
+        .join_builder()
+        .with(right_a)
+        .left_on([col("ts_a")])
+        .right_on([col("rhs_ts")])
+        .how(JoinType::AsOf(Box::default()))
+        .suffix("_a")
+        .finish()
+        .join_builder()
+        .with(right_b)
+        .left_on([col("ts_b")])
+        .right_on([col("rhs_ts")])
+        .how(JoinType::AsOf(Box::default()))
+        .suffix("_b")
+        .finish();
+
+    let plan = q.describe_optimized_plan()?;
+    assert_eq!(num_occurrences(&plan, "ASOF MANY JOIN:"), 1);
+    assert_eq!(num_occurrences(&plan, "ASOF JOIN:"), 0);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_fuse_join_asof_many_slice_applied_once_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 2, 3, 4],
+        "ts_b" => [1i64, 2, 3, 4],
+        "row" => ["r1", "r2", "r3", "r4"],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_ts" => [1i64, 2, 3, 4],
+        "v" => [10i64, 20, 30, 40],
+    )?
+    .lazy();
+
+    let fused = left
+        .join_asof_many(
+            right,
+            vec![
+                polars_ops::frame::AsofJoinPair {
+                    left_on_name: "ts_a".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_a".into()),
+                },
+                polars_ops::frame::AsofJoinPair {
+                    left_on_name: "ts_b".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_b".into()),
+                },
+            ],
+            Default::default(),
+            true,
+            false,
+            None,
+            JoinCoalesce::KeepColumns,
+        )
+        .slice(1, 2)
+        .select([col("row"), col("v"), col("v_b")])
+        .collect()?;
+
+    let expected = df!(
+        "row" => ["r2", "r3"],
+        "v" => [10i64, 20],
+        "v_b" => [10i64, 20],
+    )?;
+
+    assert!(fused.equals_missing(&expected));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "asof_join",
+    feature = "dtype-datetime",
+    feature = "dtype-duration"
+))]
+fn test_fuse_join_asof_many_tolerance_str_uses_pair_dtype_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_ms" => [10i64, 16, 25],
+        "ts_us" => [10_000i64, 16_000, 25_000],
+    )?
+    .lazy()
+    .with_columns([
+        col("ts_ms").cast(DataType::Datetime(TimeUnit::Milliseconds, None)),
+        col("ts_us").cast(DataType::Duration(TimeUnit::Microseconds)),
+    ]);
+
+    let right = df!(
+        "rhs_ms" => [5i64, 12, 20],
+        "rhs_us" => [5_000i64, 12_000, 20_000],
+        "value" => [50i64, 120, 200],
+    )?
+    .lazy()
+    .with_columns([
+        col("rhs_ms").cast(DataType::Datetime(TimeUnit::Milliseconds, None)),
+        col("rhs_us").cast(DataType::Duration(TimeUnit::Microseconds)),
+    ]);
+
+    let options = AsOfOptions {
+        tolerance_str: Some("3ms".into()),
+        ..Default::default()
+    };
+
+    let chained = left
+        .clone()
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("ts_ms")])
+        .right_on([col("rhs_ms")])
+        .how(JoinType::AsOf(Box::new(options.clone())))
+        .suffix("_ms")
+        .finish()
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("ts_us")])
+        .right_on([col("rhs_us")])
+        .how(JoinType::AsOf(Box::new(options.clone())))
+        .suffix("_us")
+        .finish()
+        .collect()?;
+
+    let fused = left
+        .join_asof_many(
+            right,
+            vec![
+                polars_ops::frame::AsofJoinPair {
+                    left_on_name: "ts_ms".into(),
+                    right_on_name: "rhs_ms".into(),
+                    suffix: Some("_ms".into()),
+                },
+                polars_ops::frame::AsofJoinPair {
+                    left_on_name: "ts_us".into(),
+                    right_on_name: "rhs_us".into(),
+                    suffix: Some("_us".into()),
+                },
+            ],
+            options,
+            true,
+            false,
+            None,
+            JoinCoalesce::KeepColumns,
+        )
+        .collect()?;
+
+    assert!(fused.equals_missing(&chained));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "asof_join",
+    feature = "dtype-datetime",
+    feature = "dtype-duration"
+))]
+fn test_fuse_join_asof_many_chained_asof_keeps_pair_tolerances_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_ms" => [10i64, 16, 25],
+        "ts_us" => [10_000i64, 16_000, 25_000],
+    )?
+    .lazy()
+    .with_columns([
+        col("ts_ms").cast(DataType::Datetime(TimeUnit::Milliseconds, None)),
+        col("ts_us").cast(DataType::Duration(TimeUnit::Microseconds)),
+    ]);
+
+    let right = df!(
+        "rhs_ms" => [5i64, 12, 20],
+        "rhs_us" => [5_000i64, 12_000, 20_000],
+        "value" => [50i64, 120, 200],
+    )?
+    .lazy()
+    .with_columns([
+        col("rhs_ms").cast(DataType::Datetime(TimeUnit::Milliseconds, None)),
+        col("rhs_us").cast(DataType::Duration(TimeUnit::Microseconds)),
+    ]);
+
+    let options = AsOfOptions {
+        tolerance_str: Some("3ms".into()),
+        ..Default::default()
+    };
+
+    let optimized = left
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("ts_ms")])
+        .right_on([col("rhs_ms")])
+        .how(JoinType::AsOf(Box::new(options.clone())))
+        .suffix("_ms")
+        .finish()
+        .join_builder()
+        .with(right)
+        .left_on([col("ts_us")])
+        .right_on([col("rhs_us")])
+        .how(JoinType::AsOf(Box::new(options)))
+        .suffix("_us")
+        .finish()
+        .to_alp_optimized()?;
+
+    let mut found_asof_many = false;
+    assert!(optimized.lp_arena.iter(optimized.lp_top).all(|(_, lp)| {
+        if let IR::Join { options, .. } = lp {
+            if let JoinType::AsOfMany(asof_many) = &options.args.how {
+                found_asof_many = true;
+                assert_eq!(
+                    asof_many.pair_tolerances.as_deref(),
+                    Some(&[Scalar::from(3i64), Scalar::from(3_000i64)][..])
+                );
+            }
+        }
+        true
+    }));
+    assert!(found_asof_many);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_fuse_join_asof_many_preserves_existing_join_level_suffix_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 3, 5],
+        "ts_b" => [2i64, 4, 6],
+        "ts_c" => [2i64, 4, 6],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_ts" => [1i64, 2, 4, 6],
+        "value" => [10i64, 20, 40, 60],
+    )?
+    .lazy();
+
+    let chained = left
+        .clone()
+        .join_asof_many(
+            right.clone(),
+            vec![
+                AsofJoinPair {
+                    left_on_name: "ts_a".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: None,
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_b".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: None,
+                },
+            ],
+            Default::default(),
+            true,
+            false,
+            Some("_a".into()),
+            JoinCoalesce::KeepColumns,
+        )
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("ts_c")])
+        .right_on([col("rhs_ts")])
+        .coalesce(JoinCoalesce::KeepColumns)
+        .how(JoinType::AsOf(Box::default()))
+        .suffix("_b")
+        .finish();
+
+    let plan = chained.clone().describe_optimized_plan()?;
+    assert_eq!(num_occurrences(&plan, "ASOF MANY JOIN:"), 1);
+    assert_eq!(num_occurrences(&plan, "ASOF JOIN:"), 0);
+
+    let out = chained
+        .clone()
+        .select([col("value"), col("value_a"), col("value_b")])
+        .collect()?;
+    let expected = left
+        .join_asof_many(
+            right,
+            vec![
+                AsofJoinPair {
+                    left_on_name: "ts_a".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: None,
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_b".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_a".into()),
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_c".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_b".into()),
+                },
+            ],
+            Default::default(),
+            true,
+            false,
+            None,
+            JoinCoalesce::KeepColumns,
+        )
+        .select([col("value"), col("value_a"), col("value_b")])
+        .collect()?;
+
+    assert!(out.equals_missing(&expected));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_asof_many_predicate_pushdown_keeps_pair_suffix_filters_local_rust() -> PolarsResult<()> {
+    let left = df!(
+        "row" => ["r1", "r2", "r3"],
+        "ts_a" => [1i64, 3, 5],
+        "ts_b" => [2i64, 4, 6],
+        "value" => [0i64, 0, 0],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_ts" => [1i64, 2, 4, 6],
+        "value" => [10i64, 20, 40, 60],
+    )?
+    .lazy();
+
+    let query = left
+        .join_asof_many(
+            right,
+            vec![
+                AsofJoinPair {
+                    left_on_name: "ts_a".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_a".into()),
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_b".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: Some("_b".into()),
+                },
+            ],
+            Default::default(),
+            true,
+            false,
+            None,
+            JoinCoalesce::KeepColumns,
+        )
+        .filter(col("value_a").gt(lit(15i64)).and(col("value_b").lt(lit(60i64))))
+        .select([col("row"), col("value"), col("value_a"), col("value_b")]);
+
+    let plan = query.clone().describe_optimized_plan()?;
+    assert_eq!(num_occurrences(&plan, "ASOF MANY JOIN:"), 1);
+
+    let out = query.clone().collect()?;
+    let expected = query.with_predicate_pushdown(false).collect()?;
+
+    assert!(out.equals_missing(&expected));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_asof_many_predicate_pushdown_handles_mixed_suffix_outputs_rust() -> PolarsResult<()> {
+    let left = df!(
+        "ts_a" => [1i64, 3, 5],
+        "ts_b" => [2i64, 4, 6],
+        "ts_c" => [2i64, 4, 6],
+    )?
+    .lazy();
+    let right = df!(
+        "rhs_ts" => [1i64, 2, 4, 6],
+        "value" => [10i64, 20, 40, 60],
+    )?
+    .lazy();
+
+    let query = left
+        .join_asof_many(
+            right,
+            vec![
+                AsofJoinPair {
+                    left_on_name: "ts_a".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: None,
+                },
+                AsofJoinPair {
+                    left_on_name: "ts_b".into(),
+                    right_on_name: "rhs_ts".into(),
+                    suffix: None,
+                },
+            ],
+            Default::default(),
+            true,
+            false,
+            Some("_a".into()),
+            JoinCoalesce::KeepColumns,
+        )
+        .filter(col("value").gt(lit(15i64)).and(col("value_a").lt(lit(60i64))))
+        .select([col("ts_a"), col("value"), col("value_a")]);
+
+    let plan = query.clone().describe_optimized_plan()?;
+    assert_eq!(num_occurrences(&plan, "ASOF MANY JOIN:"), 1);
+
+    let out = query.clone().collect()?;
+    let expected = query.with_predicate_pushdown(false).collect()?;
+
+    assert!(out.equals_missing(&expected));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(
+    feature = "asof_join",
+    feature = "dtype-datetime",
+    feature = "dtype-duration",
+    feature = "new_streaming"
+))]
+fn test_streaming_join_asof_many_tolerance_str_uses_pair_dtype_rust() -> PolarsResult<()> {
+    let left = df!(
+        "row" => ["r1", "r2", "r3"],
+        "ts_ms" => [10i64, 16, 25],
+        "ts_us" => [10_000i64, 16_000, 25_000],
+    )?
+    .lazy()
+    .with_columns([
+        col("ts_ms").cast(DataType::Datetime(TimeUnit::Milliseconds, None)),
+        col("ts_us").cast(DataType::Duration(TimeUnit::Microseconds)),
+    ]);
+
+    let right = df!(
+        "rhs_ms" => [8i64, 14, 23],
+        "rhs_us" => [8_000i64, 12_000, 20_000],
+        "value" => [80i64, 140, 230],
+    )?
+    .lazy()
+    .with_columns([
+        col("rhs_ms").cast(DataType::Datetime(TimeUnit::Milliseconds, None)),
+        col("rhs_us").cast(DataType::Duration(TimeUnit::Microseconds)),
+    ]);
+
+    let options = AsOfOptions {
+        tolerance_str: Some("3ms".into()),
+        ..Default::default()
+    };
+
+    let query = left.join_asof_many(
+        right,
+        vec![
+            polars_ops::frame::AsofJoinPair {
+                left_on_name: "ts_ms".into(),
+                right_on_name: "rhs_ms".into(),
+                suffix: Some("_ms".into()),
+            },
+            polars_ops::frame::AsofJoinPair {
+                left_on_name: "ts_us".into(),
+                right_on_name: "rhs_us".into(),
+                suffix: Some("_us".into()),
+            },
+        ],
+        options,
+        true,
+        false,
+        None,
+        JoinCoalesce::KeepColumns,
+    );
+
+    let in_memory = query.clone().collect()?;
+    let streaming = query
+        .collect_with_engine(Engine::Streaming)?
+        .unwrap_single();
+
+    assert!(streaming.equals_missing(&in_memory));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_lazy_join_asof_many_rejects_invalid_options_during_planning_rust() -> PolarsResult<()> {
+    let left = df!(
+        "time" => [1i64, 2, 3],
+        "value" => [10i64, 20, 30],
+    )?
+    .lazy();
+    let right = df!(
+        "time" => [1i64, 2, 3],
+        "value" => [100i64, 200, 300],
+    )?
+    .lazy();
+
+    let invalid_tolerance_query = left
+        .clone()
+        .join_builder()
+        .with(right.clone())
+        .left_on([col("time")])
+        .right_on([col("time")])
+        .how(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+            options: AsOfOptions::default(),
+            pairs: vec![AsofJoinPair {
+                left_on_name: "time".into(),
+                right_on_name: "time".into(),
+                suffix: None,
+            }],
+            pair_tolerances: Some(vec![Scalar::from(1i64), Scalar::from(2i64)]),
+        })))
+        .finish();
+    let err = invalid_tolerance_query.explain(true).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("invalid AsOfManyOptions: expected 1 pair tolerances, got 2"));
+
+    let mut invalid_metadata_query = left
+        .join_builder()
+        .with(right)
+        .left_on([col("time")])
+        .right_on([col("time")])
+        .how(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+            options: AsOfOptions::default(),
+            pairs: vec![AsofJoinPair {
+                left_on_name: "value".into(),
+                right_on_name: "value".into(),
+                suffix: None,
+            }],
+            pair_tolerances: None,
+        })))
+        .finish();
+    let err = invalid_metadata_query.collect_schema().unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("invalid AsOfManyOptions: pair metadata at index 0 does not match join keys"));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "asof_join", feature = "new_streaming"))]
+fn test_streaming_join_asof_many_rejects_invalid_pair_tolerance_lengths_rust() -> PolarsResult<()> {
+    let left = df!(
+        "time" => [1i64, 2, 3],
+        "value" => [10i64, 20, 30],
+    )?
+    .lazy();
+    let right = df!(
+        "time" => [1i64, 2, 3],
+        "value" => [100i64, 200, 300],
+    )?
+    .lazy();
+
+    let err = match left
+        .join_builder()
+        .with(right)
+        .left_on([col("time")])
+        .right_on([col("time")])
+        .how(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+            options: AsOfOptions::default(),
+            pairs: vec![AsofJoinPair {
+                left_on_name: "time".into(),
+                right_on_name: "time".into(),
+                suffix: None,
+            }],
+            pair_tolerances: Some(vec![Scalar::from(1i64), Scalar::from(2i64)]),
+        })))
+        .finish()
+        .collect_with_engine(Engine::Streaming)
+    {
+        Ok(_) => panic!("expected error"),
+        Err(err) => err,
+    };
+
+    assert!(err
+        .to_string()
+        .contains("invalid AsOfManyOptions: expected 1 pair tolerances, got 2"));
+
+    Ok(())
+}
+
+#[test]
+#[cfg(all(feature = "asof_join", feature = "new_streaming"))]
+fn test_streaming_join_asof_many_rejects_mismatched_pair_metadata_rust() -> PolarsResult<()> {
+    let left = df!(
+        "time" => [1i64, 2, 3],
+        "value" => [10i64, 20, 30],
+    )?
+    .lazy();
+    let right = df!(
+        "time" => [1i64, 2, 3],
+        "value" => [100i64, 200, 300],
+    )?
+    .lazy();
+
+    let err = match left
+        .join_builder()
+        .with(right)
+        .left_on([col("time")])
+        .right_on([col("time")])
+        .how(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+            options: AsOfOptions::default(),
+            pairs: vec![AsofJoinPair {
+                left_on_name: "value".into(),
+                right_on_name: "value".into(),
+                suffix: None,
+            }],
+            pair_tolerances: None,
+        })))
+        .finish()
+        .collect_with_engine(Engine::Streaming)
+    {
+        Ok(_) => panic!("expected error"),
+        Err(err) => err,
+    };
+
+    assert!(err
+        .to_string()
+        .contains("invalid AsOfManyOptions: pair metadata at index 0 does not match join keys"));
 
     Ok(())
 }

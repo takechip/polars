@@ -5,6 +5,39 @@ use crate::plans::optimizer::join_utils::remove_suffix;
 
 const IEJOIN_MAX_PREDICATES: usize = 2;
 
+#[cfg(feature = "asof_join")]
+fn get_asof_many_output_to_right_input_map(
+    options: &JoinOptionsIR,
+    schema_left: &Schema,
+    schema_right: &Schema,
+) -> PlHashMap<PlSmallStr, PlSmallStr> {
+    let JoinType::AsOfMany(asof_many_options) = &options.args.how else {
+        return Default::default();
+    };
+
+    let mut output_to_right_input =
+        PlHashMap::with_capacity(schema_right.len() * asof_many_options.pairs.len());
+
+    for pair in &asof_many_options.pairs {
+        let pair_suffix = pair
+            .suffix
+            .as_ref()
+            .unwrap_or_else(|| options.args.suffix());
+
+        for name in schema_right.iter_names() {
+            let output_name = if schema_left.contains(name.as_str()) {
+                format_pl_smallstr!("{}{}", name, pair_suffix)
+            } else {
+                name.clone()
+            };
+
+            output_to_right_input.insert(output_name, name.clone());
+        }
+    }
+
+    output_to_right_input
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_join(
     opt: &mut PredicatePushDown,
@@ -212,6 +245,9 @@ pub(super) fn process_join(
         PlHashMap::with_capacity(get_lhs_column_keys_iter().len());
     let mut output_key_to_right_input_map: PlHashMap<PlSmallStr, PlSmallStr> =
         PlHashMap::with_capacity(get_rhs_column_keys_iter().len());
+    #[cfg(feature = "asof_join")]
+    let asof_many_output_to_right_input_map =
+        get_asof_many_output_to_right_input_map(&options, &schema_left, &schema_right);
 
     for (lhs_input_key, rhs_input_key) in get_lhs_column_keys_iter().zip(get_rhs_column_keys_iter())
     {
@@ -274,22 +310,53 @@ pub(super) fn process_join(
     for (_, predicate) in acc_predicates {
         let mut push_left = true;
         let mut push_right = true;
+        let mut keep_local = false;
 
         for col_name in aexpr_to_leaf_names_iter(predicate.node(), expr_arena) {
-            let origin: ExprOrigin = ExprOrigin::get_column_origin(
+            let origin = ExprOrigin::get_column_origin(
                 col_name.as_str(),
                 &schema_left,
                 &schema_right,
                 options.args.suffix(),
                 Some(&|name| coalesced_to_right.contains(name)),
-            )
-            .unwrap();
+            );
+
+            #[cfg(feature = "asof_join")]
+            let origin = match origin {
+                Ok(origin) => Some(origin),
+                Err(_) if matches!(&options.args.how, JoinType::AsOfMany(_))
+                    && schema.contains(col_name.as_str()) =>
+                {
+                    None
+                },
+                Err(err) => return Err(err),
+            };
+
+            #[cfg(not(feature = "asof_join"))]
+            let origin = Some(origin?);
+
+            let Some(origin) = origin else {
+                push_left = false;
+                push_right = false;
+                keep_local = true;
+                continue;
+            };
 
             push_left &= matches!(origin, ExprOrigin::Left | ExprOrigin::None)
                 || output_key_to_left_input_map.contains_key(col_name);
 
             push_right &= matches!(origin, ExprOrigin::Right | ExprOrigin::None)
                 || output_key_to_right_input_map.contains_key(col_name);
+
+            #[cfg(feature = "asof_join")]
+            if matches!(&options.args.how, JoinType::AsOfMany(_))
+                && matches!(origin, ExprOrigin::Right)
+                && !schema_right.contains(col_name.as_str())
+                && !asof_many_output_to_right_input_map.contains_key(col_name)
+            {
+                push_right = false;
+                keep_local = true;
+            }
         }
 
         // Note: If `push_left` and `push_right` are both `true`, it means the predicate refers only
@@ -357,7 +424,7 @@ pub(super) fn process_join(
             JoinType::IEJoin | JoinType::Range => !(push_left || push_right),
         };
 
-        if has_residual {
+        if has_residual || keep_local {
             local_predicates.push(predicate.clone())
         }
 
@@ -370,6 +437,10 @@ pub(super) fn process_join(
         if push_right {
             let mut predicate = predicate;
             map_column_references(&mut predicate, expr_arena, &output_key_to_right_input_map);
+            #[cfg(feature = "asof_join")]
+            if matches!(&options.args.how, JoinType::AsOfMany(_)) {
+                map_column_references(&mut predicate, expr_arena, &asof_many_output_to_right_input_map);
+            }
             remove_suffix(
                 &mut predicate,
                 expr_arena,

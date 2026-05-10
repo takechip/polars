@@ -181,6 +181,7 @@ mod test {
     use arrow::array::PrimitiveArray;
 
     use super::*;
+    use crate::frame::join::{AsOfManyOptions, AsOfOptions, AsofJoinPair, DataFrameJoinOps, JoinArgs, JoinType};
 
     #[test]
     fn test_asof_backward() {
@@ -237,5 +238,280 @@ mod test {
         let tuples = join_asof_forward::<Int32Type, _>(&a, &b, |_, _| true, true);
         assert_eq!(tuples.len(), a.len());
         assert_eq!(tuples.to_vec(), &[Some(0), Some(0), Some(1), Some(2), None]);
+    }
+
+    #[test]
+    fn test_asof_many_rejects_invalid_option_lengths() -> PolarsResult<()> {
+        let left = df! {
+            "time" => [1i64, 2, 3],
+            "value" => [10i64, 20, 30],
+        }?;
+        let right = df! {
+            "time" => [1i64, 2, 3],
+            "value" => [100i64, 200, 300],
+        }?;
+
+        let mismatched_pairs = left.join(
+            &right,
+            ["time"],
+            ["time"],
+            JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                options: AsOfOptions::default(),
+                pairs: vec![
+                    AsofJoinPair {
+                        left_on_name: "time".into(),
+                        right_on_name: "time".into(),
+                        suffix: None,
+                    },
+                    AsofJoinPair {
+                        left_on_name: "value".into(),
+                        right_on_name: "value".into(),
+                        suffix: None,
+                    },
+                ],
+                pair_tolerances: None,
+            }))),
+            None,
+        );
+        assert!(mismatched_pairs
+            .unwrap_err()
+            .to_string()
+            .contains("invalid AsOfManyOptions"));
+
+        let mismatched_tolerances = left.join(
+            &right,
+            ["time"],
+            ["time"],
+            JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                options: AsOfOptions::default(),
+                pairs: vec![AsofJoinPair {
+                    left_on_name: "time".into(),
+                    right_on_name: "time".into(),
+                    suffix: None,
+                }],
+                pair_tolerances: Some(vec![Scalar::from(1i64), Scalar::from(2i64)]),
+            }))),
+            None,
+        );
+        assert!(mismatched_tolerances
+            .unwrap_err()
+            .to_string()
+            .contains("invalid AsOfManyOptions"));
+
+        let empty_pairs = left.join(
+            &right,
+            [] as [&str; 0],
+            [] as [&str; 0],
+            JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                options: AsOfOptions::default(),
+                pairs: vec![],
+                pair_tolerances: None,
+            }))),
+            None,
+        );
+        assert!(empty_pairs
+            .unwrap_err()
+            .to_string()
+            .contains("expected at least one pair in 'join_asof_many'"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_asof_many_rejects_mismatched_pair_metadata() -> PolarsResult<()> {
+        let left = df! {
+            "time" => [1i64, 2, 3],
+            "value" => [10i64, 20, 30],
+        }?;
+        let right = df! {
+            "time" => [1i64, 2, 3],
+            "value" => [100i64, 200, 300],
+        }?;
+
+        let err = left
+            .join(
+                &right,
+                ["time"],
+                ["time"],
+                JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                    options: AsOfOptions::default(),
+                    pairs: vec![AsofJoinPair {
+                        left_on_name: "value".into(),
+                        right_on_name: "value".into(),
+                        suffix: None,
+                    }],
+                    pair_tolerances: None,
+                }))),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("invalid AsOfManyOptions: pair metadata at index 0 does not match join keys"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_asof_many_requires_both_by_sides() -> PolarsResult<()> {
+        let left = df! {
+            "time" => [1i64, 2, 3],
+            "group" => ["a", "a", "b"],
+            "value" => [10i64, 20, 30],
+        }?;
+        let right = df! {
+            "time" => [1i64, 2, 3],
+            "group" => ["a", "a", "b"],
+            "value" => [100i64, 200, 300],
+        }?;
+
+        let err = left
+            .join(
+                &right,
+                ["time"],
+                ["time"],
+                JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                    options: AsOfOptions {
+                        left_by: Some(vec!["group".into()]),
+                        right_by: None,
+                        ..Default::default()
+                    },
+                    pairs: vec![AsofJoinPair {
+                        left_on_name: "time".into(),
+                        right_on_name: "time".into(),
+                        suffix: None,
+                    }],
+                    pair_tolerances: None,
+                }))),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("expected both 'by_left' and 'by_right' to be set in 'join_asof_many'"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_asof_many_requires_matching_by_widths() -> PolarsResult<()> {
+        let left = df! {
+            "time" => [1i64, 2, 3],
+            "group" => ["a", "a", "b"],
+            "bucket" => [1i32, 1, 2],
+            "value" => [10i64, 20, 30],
+        }?;
+        let right = df! {
+            "time" => [1i64, 2, 3],
+            "group" => ["a", "a", "b"],
+            "value" => [100i64, 200, 300],
+        }?;
+
+        let err = left
+            .join(
+                &right,
+                ["time"],
+                ["time"],
+                JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                    options: AsOfOptions {
+                        left_by: Some(vec!["group".into(), "bucket".into()]),
+                        right_by: Some(vec!["group".into()]),
+                        ..Default::default()
+                    },
+                    pairs: vec![AsofJoinPair {
+                        left_on_name: "time".into(),
+                        right_on_name: "time".into(),
+                        suffix: None,
+                    }],
+                    pair_tolerances: None,
+                }))),
+                None,
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("expected equal number of columns in 'by_left' and 'by_right' in 'join_asof_many'"));
+
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(all(feature = "dtype-datetime", feature = "dtype-duration"))]
+    fn test_asof_many_eager_tolerance_str_uses_pair_dtype() -> PolarsResult<()> {
+        let mut left = df!(
+            "row" => ["r1", "r2", "r3"],
+            "ts_ms" => [10i64, 16, 25],
+            "ts_us" => [10_000i64, 16_000, 25_000],
+        )?;
+        left.with_column(
+            left.column("ts_ms")?
+                .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
+                .into_column(),
+        )?;
+        left.with_column(
+            left.column("ts_us")?
+                .cast(&DataType::Duration(TimeUnit::Microseconds))?
+                .into_column(),
+        )?;
+
+        let mut right = df!(
+            "rhs_ms" => [8i64, 14, 23],
+            "rhs_us" => [8_000i64, 12_000, 20_000],
+            "value" => [80i64, 140, 230],
+        )?;
+        right.with_column(
+            right
+                .column("rhs_ms")?
+                .cast(&DataType::Datetime(TimeUnit::Milliseconds, None))?
+                .into_column(),
+        )?;
+        right.with_column(
+            right
+                .column("rhs_us")?
+                .cast(&DataType::Duration(TimeUnit::Microseconds))?
+                .into_column(),
+        )?;
+
+        let options = AsOfOptions {
+            tolerance_str: Some("3ms".into()),
+            ..Default::default()
+        };
+
+        let fused = left.join(
+            &right,
+            ["ts_ms", "ts_us"],
+            ["rhs_ms", "rhs_us"],
+            JoinArgs::new(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                options,
+                pairs: vec![
+                    AsofJoinPair {
+                        left_on_name: "ts_ms".into(),
+                        right_on_name: "rhs_ms".into(),
+                        suffix: Some("_ms".into()),
+                    },
+                    AsofJoinPair {
+                        left_on_name: "ts_us".into(),
+                        right_on_name: "rhs_us".into(),
+                        suffix: Some("_us".into()),
+                    },
+                ],
+                pair_tolerances: None,
+            }))),
+            None,
+        )?;
+
+        let expected = df!(
+            "row" => ["r1", "r2", "r3"],
+            "value" => [80i64, 140, 230],
+            "value_us" => [Some(80i64), None, None],
+        )?;
+
+        let fused = fused.select(["row", "value", "value_us"])?;
+        assert!(fused.equals_missing(&expected));
+
+        Ok(())
     }
 }

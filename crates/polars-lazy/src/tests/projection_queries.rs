@@ -220,3 +220,67 @@ fn test_select_hconcat_pushdown_non_strict_25263() -> PolarsResult<()> {
 
     Ok(())
 }
+
+#[test]
+#[cfg(feature = "asof_join")]
+fn test_join_asof_many_projection_pushdown() -> PolarsResult<()> {
+    let left = df!(
+        "ts" => [1i64, 3, 5],
+        "left_keep" => [10i64, 20, 30],
+        "payload" => [-1i64, -1, -1],
+        "drop_left" => [0i64, 0, 0],
+    )?
+    .lazy();
+
+    let right = df!(
+        "ts" => [1i64, 2, 4, 7],
+        "payload" => [100i64, 200, 400, 700],
+        "drop_right" => [9i64, 9, 9, 9],
+    )?
+    .lazy();
+
+    let plan = left
+        .join_asof_many(
+            right,
+            vec![polars_ops::frame::AsofJoinPair {
+                left_on_name: "ts".into(),
+                right_on_name: "ts".into(),
+                suffix: Some("_a".into()),
+            }],
+            Default::default(),
+            true,
+            false,
+            Some("_right".into()),
+            JoinCoalesce::KeepColumns,
+        )
+        .select([col("left_keep"), col("payload_a")])
+        .to_alp_optimized()?;
+
+    let node = plan.lp_top;
+    let lp_arena = plan.lp_arena;
+
+    assert!(lp_arena.iter(node).all(|(_, plan)| match plan {
+        IR::DataFrameScan {
+            schema,
+            output_schema,
+            ..
+        } => {
+            let projected = output_schema.as_ref().unwrap();
+            if schema.contains("left_keep") {
+                assert_eq!(projected.len(), 3);
+                assert!(projected.contains("ts"));
+                assert!(projected.contains("left_keep"));
+                assert!(projected.contains("payload"));
+            }
+            if schema.contains("drop_right") {
+                assert_eq!(projected.len(), 2);
+                assert!(projected.contains("ts"));
+                assert!(projected.contains("payload"));
+            }
+            true
+        },
+        _ => true,
+    }));
+
+    Ok(())
+}

@@ -231,9 +231,10 @@ pub fn optimize(
         #[cfg(feature = "merge_sorted")]
         rules.push(Box::new(FlattenMergeSortedRule::new()));
         rules.push(Box::new(FlattenUnionRule {}));
-        #[cfg(feature = "asof_join")]
-        rules.push(Box::new(FuseAsofMany {}));
     }
+
+    #[cfg(feature = "asof_join")]
+    rules.push(Box::new(FuseAsofMany {}));
 
     root = opt.optimize_loop(&mut rules, expr_arena, ir_arena, root)?;
 

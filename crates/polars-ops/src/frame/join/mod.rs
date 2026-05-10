@@ -19,8 +19,8 @@ pub use args::*;
 use arrow::trusted_len::TrustedLen;
 #[cfg(feature = "asof_join")]
 pub use asof::{
-    _check_asof_columns, _join_asof_dispatch, AsOfManyOptions, AsOfOptions, AsofJoin,
-    AsofJoinBy, AsofJoinPair, AsofStrategy,
+    _check_asof_columns, _join_asof_dispatch, AsOfManyOptions, AsOfOptions, AsofJoin, AsofJoinBy,
+    AsofJoinPair, AsofStrategy, validate_asof_many_options,
 };
 pub use cross_join::CrossJoin;
 #[cfg(feature = "chunked_ids")]
@@ -39,7 +39,6 @@ use polars_core::POOL;
 use polars_core::chunked_array::ops::row_encode::{
     encode_rows_vertical_par_unordered, encode_rows_vertical_par_unordered_broadcast_nulls,
 };
-use polars_core::datatypes::DataType;
 use polars_core::hashing::_HASHMAP_INIT_SIZE;
 use polars_core::prelude::*;
 pub(super) use polars_core::series::IsSorted;
@@ -254,41 +253,72 @@ pub trait DataFrameJoinOps: IntoDf {
 
         #[cfg(feature = "asof_join")]
         if let JoinType::AsOfMany(ref options) = args.how {
-            let mut out = left_df.clone();
+            let left_on_names = selected_left
+                .iter()
+                .map(|column| column.name().clone())
+                .collect::<Vec<_>>();
+            let right_on_names = selected_right
+                .iter()
+                .map(|column| column.name().clone())
+                .collect::<Vec<_>>();
+            validate_asof_many_options(options, &left_on_names, &right_on_names)?;
 
-            for ((s_left, s_right), pair) in selected_left
+            let mut out = left_df.clone();
+            let slice = args.slice;
+
+            for (idx, ((s_left, s_right), pair)) in selected_left
                 .iter()
                 .zip(&selected_right)
                 .zip(options.pairs.iter())
+                .enumerate()
             {
                 let mut pair_args = args.clone();
                 pair_args.how = JoinType::AsOf(Box::new(options.options.clone()));
                 pair_args.suffix = pair.suffix.clone().or_else(|| pair_args.suffix.clone());
+                pair_args.slice = None;
+                let tolerance = if let Some(pair_tolerances) = options.pair_tolerances.as_ref() {
+                    Some(pair_tolerances[idx].clone())
+                } else {
+                    asof::materialize_asof_tolerance(
+                        s_left.dtype(),
+                        options.options.tolerance.as_ref(),
+                        options.options.tolerance_str.as_deref(),
+                    )?
+                }
+                .map(|v| v.into_value());
 
                 out = match (
                     options.options.left_by.clone(),
                     options.options.right_by.clone(),
                 ) {
-                    (Some(left_by), Some(right_by)) => out._join_asof_by(
-                        other,
-                        s_left,
-                        s_right,
-                        left_by,
-                        right_by,
-                        options.options.strategy,
-                        options.options.tolerance.clone().map(|v| v.into_value()),
-                        pair_args.suffix.clone(),
-                        pair_args.slice,
-                        pair_args.should_coalesce(),
-                        options.options.allow_eq,
-                        options.options.check_sortedness,
-                    )?,
+                    (Some(left_by), Some(right_by)) => {
+                        polars_ensure!(
+                            left_by.len() == right_by.len(),
+                            InvalidOperation:
+                                "expected equal number of columns in 'by_left' and 'by_right' in 'join_asof_many'"
+                        );
+
+                        out._join_asof_by(
+                            other,
+                            s_left,
+                            s_right,
+                            left_by,
+                            right_by,
+                            options.options.strategy,
+                            tolerance.clone(),
+                            pair_args.suffix.clone(),
+                            pair_args.slice,
+                            pair_args.should_coalesce(),
+                            options.options.allow_eq,
+                            options.options.check_sortedness,
+                        )?
+                    },
                     (None, None) => out._join_asof(
                         other,
                         s_left,
                         s_right,
                         options.options.strategy,
-                        options.options.tolerance.clone().map(|v| v.into_value()),
+                        tolerance,
                         pair_args.suffix.clone(),
                         pair_args.slice,
                         pair_args.should_coalesce(),
@@ -296,9 +326,16 @@ pub trait DataFrameJoinOps: IntoDf {
                         options.options.check_sortedness,
                     )?,
                     _ => {
-                        panic!("expected by arguments on both sides")
+                        polars_bail!(
+                            InvalidOperation:
+                                "expected both 'by_left' and 'by_right' to be set in 'join_asof_many'"
+                        )
                     },
                 };
+            }
+
+            if let Some((offset, len)) = slice {
+                out = out.slice(offset, len);
             }
 
             return Ok(out);

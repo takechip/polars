@@ -6229,7 +6229,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         other
             Lazy DataFrame to join with.
         pairs
-            Sequence of ``AsofJoinPair`` specifications.
+            Sequence of ``AsofJoinPair`` specifications. Each pair currently requires
+            column-name keys; expression keys are not supported.
         by_left
             Join on these columns before doing asof join.
         by_right
@@ -6239,7 +6240,8 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         strategy : {'backward', 'forward', 'nearest'}
             Join strategy.
         suffix
-            Default suffix to append to columns with a duplicate name.
+            Default suffix to append to duplicate right-hand column names. A pair's
+            ``AsofJoinPair.suffix`` overrides this value for that pair only.
         allow_exact_matches
             Whether exact matches are valid join predicates.
         allow_parallel
@@ -6251,7 +6253,9 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
         coalesce
             Whether to coalesce join columns.
         tolerance
-            Numeric or temporal tolerance, following ``join_asof`` semantics.
+            Numeric or temporal tolerance, following ``join_asof`` semantics. If this
+            is provided as a string duration, it is interpreted separately for each
+            pair using that pair's left key dtype.
         check_sortedness
             Check the sortedness of the asof keys.
 
@@ -6282,10 +6286,27 @@ naive plan: (run LazyFrame.explain(optimized=True) to see the optimized plan)
             tolerance_num = tolerance
 
         parsed_pairs = []
-        for pair in pairs:
-            left_on = pair.left_on if isinstance(pair.left_on, pl.Expr) else F.col(pair.left_on)
-            right_on = pair.right_on if isinstance(pair.right_on, pl.Expr) else F.col(pair.right_on)
-            parsed_pairs.append((left_on._pyexpr, right_on._pyexpr, pair.suffix))
+        for i, pair in enumerate(pairs):
+            if not all(
+                hasattr(pair, attr) for attr in ("left_on", "right_on", "suffix")
+            ):
+                msg = (
+                    "expected each item in `pairs` to be an AsofJoinPair-like "
+                    "object with `left_on`, `right_on`, and `suffix` attributes; "
+                    f"item {i} is {qualified_type_name(pair)!r}"
+                )
+                raise TypeError(msg)
+
+            if not isinstance(pair.left_on, str) or not isinstance(pair.right_on, str):
+                msg = (
+                    "join_asof_many currently requires column-name AsofJoinPair keys; "
+                    "expression keys are not supported"
+                )
+                raise InvalidOperationError(msg)
+
+            parsed_pairs.append(
+                (F.col(pair.left_on)._pyexpr, F.col(pair.right_on)._pyexpr, pair.suffix)
+            )
 
         return self._from_pyldf(
             self._ldf.join_asof_many(

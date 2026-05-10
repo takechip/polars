@@ -70,6 +70,8 @@ pub enum JoinType {
     // Box is okay because this is inside a `Arc<JoinOptionsIR>`
     #[cfg(feature = "asof_join")]
     AsOf(Box<AsOfOptions>),
+    /// This functionality is unstable. It may be changed at any point without it
+    /// being considered a breaking change.
     #[cfg(feature = "asof_join")]
     AsOfMany(Box<AsOfManyOptions>),
     #[cfg(feature = "semi_anti_join")]
@@ -314,7 +316,7 @@ impl JoinType {
     pub fn is_asof(&self) -> bool {
         #[cfg(feature = "asof_join")]
         {
-            matches!(self, JoinType::AsOf(_))
+            matches!(self, JoinType::AsOf(_) | JoinType::AsOfMany(_))
         }
         #[cfg(not(feature = "asof_join"))]
         {
@@ -346,6 +348,18 @@ impl JoinType {
         {
             false
         }
+    }
+}
+
+#[cfg(all(test, feature = "asof_join"))]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_join_type_is_asof_includes_asof_many() {
+        assert!(JoinType::AsOf(Box::default()).is_asof());
+        assert!(JoinType::AsOfMany(Box::default()).is_asof());
+        assert!(!JoinType::Left.is_asof());
     }
 }
 

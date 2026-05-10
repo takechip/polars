@@ -39,4 +39,5 @@ pub use ir::*;
 pub use iterator::*;
 pub use lit::*;
 pub use optimizer::*;
-pub use schema::*;
+pub(crate) use schema::det_join_schema;
+pub use schema::{CachedSchema, FileInfo, get_input, get_input_schema};

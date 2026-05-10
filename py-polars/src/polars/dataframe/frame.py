@@ -8223,9 +8223,13 @@ class DataFrame:
         This is similar to :meth:`join_asof`, except that multiple asof matches are
         computed against the same ``other`` frame in pair order.
 
+        Parameters are the same as :meth:`LazyFrame.join_asof_many`.
+
         This functionality is experimental. It may be changed at any point without it
         being considered a breaking change.
         """
+        require_same_type(self, other)
+
         from polars.lazyframe.opt_flags import QueryOptFlags
 
         return (

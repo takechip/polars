@@ -1888,6 +1888,10 @@ impl LazyFrame {
         Self::from_logical_plan(lp, opt_state)
     }
 
+    /// Perform multiple asof joins against the same right-hand frame.
+    ///
+    /// This functionality is unstable. It may be changed at any point without it
+    /// being considered a breaking change.
     #[cfg(feature = "asof_join")]
     pub fn join_asof_many(
         self,
@@ -1916,7 +1920,11 @@ impl LazyFrame {
             .allow_parallel(allow_parallel)
             .force_parallel(force_parallel)
             .coalesce(coalesce)
-            .how(JoinType::AsOfMany(Box::new(AsOfManyOptions { options, pairs })));
+            .how(JoinType::AsOfMany(Box::new(AsOfManyOptions {
+                options,
+                pairs,
+                pair_tolerances: None,
+            })));
 
         if let Some(suffix) = suffix {
             builder = builder.suffix(suffix);

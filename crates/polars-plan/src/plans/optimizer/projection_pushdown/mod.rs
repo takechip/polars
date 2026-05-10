@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use edge::Edge;
 use polars_core::frame::DataFrame;
-use polars_core::prelude::{Column, DataType, PlHashMap, ScratchIndexMap, ScratchIndexSet};
+use polars_core::prelude::{Column, DataType, PlHashMap, PlIndexSet, ScratchIndexMap, ScratchIndexSet};
 use polars_core::schema::Schema;
 use polars_io::RowIndex;
 use polars_ops::frame::{JoinCoalesce, JoinType};
@@ -26,7 +26,7 @@ use crate::plans::{
     AExpr, ArenaExprIter, ExprIR, ExprOrigin, FunctionIR, IR, IRAggExpr, IRBuilder, IRFunctionExpr,
     OutputName, det_join_schema,
 };
-use crate::prelude::{DistinctOptionsIR, ProjectionOptions};
+use crate::prelude::{DistinctOptionsIR, JoinArgs, JoinOptionsIR, ProjectionOptions};
 use crate::traversal::edge_provider::NodeEdgesProvider;
 use crate::traversal::visitor::{NodeVisitor, SubtreeVisit};
 use crate::utils::{aexpr_to_leaf_names_iter, rename_columns};
@@ -848,19 +848,201 @@ impl ProjectionPushdownVisitor<'_, '_> {
                 };
 
                 #[cfg(feature = "asof_join")]
-                if matches!(&options.args.how, JoinType::AsOfMany(_)) {
-                    *edges.inputs()[0].projection_state_mut() = ProjectionState {
-                        projection: Projection::Names,
-                        names: Some(Box::new(
-                            input_schema_left.iter_names_cloned().collect(),
-                        )),
+                if let JoinType::AsOfMany(asof_many_options) = &options.args.how {
+                    let opt_projected_names =
+                        out_edge.compute_projected_names(output_schema_arc).cloned();
+                    let is_projected_in_output = |name: &str| {
+                        if let Some(projected_names) = &opt_projected_names {
+                            projected_names.contains(name)
+                        } else {
+                            output_schema_arc.contains(name)
+                        }
                     };
-                    *edges.inputs()[1].projection_state_mut() = ProjectionState {
-                        projection: Projection::Names,
-                        names: Some(Box::new(
-                            input_schema_right.iter_names_cloned().collect(),
-                        )),
+
+                    let project_left = self.names_set_scratch.get();
+                    let project_right = self.names_set_scratch2.get();
+
+                    project_left.reserve(input_schema_left.len());
+                    project_right.reserve(input_schema_right.len());
+
+                    let mut current_left_schema = input_schema_left.clone();
+                    let mut stage_schemas = Vec::with_capacity(asof_many_options.pairs.len());
+
+                    for ((left_expr, right_expr), pair) in left_on
+                        .iter()
+                        .zip(right_on.iter())
+                        .zip(asof_many_options.pairs.iter())
+                    {
+                        let pair_options = JoinOptionsIR {
+                            allow_parallel: options.allow_parallel,
+                            force_parallel: options.force_parallel,
+                            args: JoinArgs {
+                                how: JoinType::AsOf(Box::new(asof_many_options.options.clone())),
+                                validation: options.args.validation,
+                                suffix: pair.suffix.clone().or_else(|| options.args.suffix.clone()),
+                                slice: options.args.slice,
+                                nulls_equal: options.args.nulls_equal,
+                                coalesce: options.args.coalesce,
+                                maintain_order: options.args.maintain_order,
+                                build_side: options.args.build_side.clone(),
+                            },
+                            options: options.options.clone(),
+                        };
+                        let pair_suffix = pair_options.args.suffix().clone();
+                        let next_left_schema = det_join_schema(
+                            &current_left_schema,
+                            &input_schema_right,
+                            std::slice::from_ref(left_expr),
+                            std::slice::from_ref(right_expr),
+                            &pair_options,
+                            self.expr_arena,
+                        )
+                        .unwrap();
+
+                        stage_schemas.push((current_left_schema.clone(), pair_suffix));
+                        current_left_schema = next_left_schema;
+                    }
+
+                    let mut needed_names = if let Some(projected_names) = &opt_projected_names {
+                        projected_names.iter().cloned().collect::<PlIndexSet<_>>()
+                    } else {
+                        output_schema_arc.iter_names_cloned().collect::<PlIndexSet<_>>()
                     };
+
+                    for output_name in output_schema_arc
+                        .iter_names()
+                        .filter(|name| is_projected_in_output(name))
+                    {
+                        needed_names.insert(output_name.clone());
+                    }
+
+                    for stage_idx in (0..asof_many_options.pairs.len()).rev() {
+                        let (stage_left_schema, pair_suffix) = &stage_schemas[stage_idx];
+                        let mut previous_needed_names = PlIndexSet::default();
+
+                        for output_name in needed_names.iter() {
+                            match ExprOrigin::get_column_origin(
+                                output_name,
+                                stage_left_schema,
+                                &input_schema_right,
+                                pair_suffix.as_str(),
+                                None,
+                            )
+                            .unwrap()
+                            {
+                                ExprOrigin::None => {},
+                                ExprOrigin::Left => {
+                                    previous_needed_names.insert(output_name.clone());
+                                },
+                                ExprOrigin::Right => {
+                                    let (name, keeps_suffix) =
+                                        if !input_schema_right.contains(output_name.as_str()) {
+                                            (
+                                                PlSmallStr::from_str(
+                                                    output_name
+                                                        .strip_suffix(pair_suffix.as_str())
+                                                        .unwrap(),
+                                                ),
+                                                true,
+                                            )
+                                        } else {
+                                            (output_name.clone(), false)
+                                        };
+
+                                    debug_assert!(input_schema_right.contains(name.as_str()));
+
+                                    // Keep the colliding left column so the staged join schema
+                                    // still produces the projected suffixed right-hand name.
+                                    if keeps_suffix && stage_left_schema.contains(name.as_str()) {
+                                        previous_needed_names.insert(name.clone());
+                                    }
+
+                                    project_right.insert(name);
+                                },
+                                ExprOrigin::Both => unreachable!(),
+                            }
+                        }
+
+                        previous_needed_names.extend(
+                            aexpr_to_leaf_names_iter(left_on[stage_idx].node(), self.expr_arena)
+                                .cloned(),
+                        );
+                        project_right.extend(
+                            aexpr_to_leaf_names_iter(right_on[stage_idx].node(), self.expr_arena)
+                                .cloned(),
+                        );
+
+                        if let Some(left_by) = asof_many_options.options.left_by.as_deref() {
+                            previous_needed_names.extend(left_by.iter().cloned());
+                        }
+
+                        if let Some(right_by) = asof_many_options.options.right_by.as_deref() {
+                            project_right.extend(right_by.iter().cloned());
+                        }
+
+                        needed_names = previous_needed_names;
+                    }
+
+                    project_left.extend(
+                        needed_names
+                            .into_iter()
+                            .filter(|name| input_schema_left.contains(name.as_str())),
+                    );
+
+                    let new_input_schema_left = if project_left.len() == input_schema_left.len() {
+                        input_schema_left.clone()
+                    } else {
+                        Arc::new(input_schema_left.try_project(project_left.iter()).unwrap())
+                    };
+
+                    let new_input_schema_right = if project_right.len() == input_schema_right.len() {
+                        input_schema_right.clone()
+                    } else {
+                        Arc::new(
+                            input_schema_right
+                                .try_project(project_right.iter())
+                                .unwrap(),
+                        )
+                    };
+
+                    let new_output_schema = det_join_schema(
+                        &new_input_schema_left,
+                        &new_input_schema_right,
+                        left_on,
+                        right_on,
+                        options,
+                        self.expr_arena,
+                    )
+                    .unwrap();
+
+                    if project_left.len() != input_schema_left.len() {
+                        *edges.inputs()[0].projection_state_mut() = ProjectionState {
+                            projection: Projection::Names,
+                            names: Some(Box::new(mem::take(project_left))),
+                        };
+                    }
+
+                    if project_right.len() != input_schema_right.len() {
+                        *edges.inputs()[1].projection_state_mut() = ProjectionState {
+                            projection: Projection::Names,
+                            names: Some(Box::new(mem::take(project_right))),
+                        };
+                    }
+
+                    *output_schema_arc = new_output_schema;
+
+                    if let Some(projected_names) = &opt_projected_names
+                        && let Some(schema) = compute_simple_projection_schema(
+                            projected_names.as_slice(),
+                            output_schema_arc,
+                            false,
+                        )
+                    {
+                        edges.outputs()[0]
+                            .parent_key_and_port_mut()
+                            .attach_simple_projection(Arc::new(schema), storage);
+                    }
+
                     return;
                 }
 
