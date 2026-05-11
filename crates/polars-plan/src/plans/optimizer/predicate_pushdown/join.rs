@@ -32,6 +32,20 @@ pub(super) fn process_join(
         return opt.no_pushdown_restart_opt(lp, acc_predicates, lp_arena, expr_arena);
     }
 
+    #[cfg(feature = "asof_join")]
+    if matches!(&options.args.how, JoinType::AsOfMany(_)) {
+        let lp = IR::Join {
+            input_left,
+            input_right,
+            left_on,
+            right_on,
+            schema,
+            options,
+        };
+
+        return opt.no_pushdown_restart_opt(lp, acc_predicates, lp_arena, expr_arena);
+    }
+
     let schema_left = lp_arena.get(input_left).schema(lp_arena).into_owned();
     let schema_right = lp_arena.get(input_right).schema(lp_arena).into_owned();
 
@@ -199,7 +213,7 @@ pub(super) fn process_join(
             Left | Inner | Full => true,
 
             #[cfg(feature = "asof_join")]
-            AsOf(_) => true,
+            AsOf(_) | AsOfMany(_) => true,
             #[cfg(feature = "semi_anti_join")]
             Semi | Anti => true,
 
@@ -307,7 +321,7 @@ pub(super) fn process_join(
             // Behaves similarly to left-join on "by" columns (takes a single match instead of
             // all matches according to asof strategy).
             #[cfg(feature = "asof_join")]
-            JoinType::AsOf(_) => {
+            JoinType::AsOf(_) | JoinType::AsOfMany(_) => {
                 push_right &= push_left;
                 !push_left
             },

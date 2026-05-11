@@ -496,7 +496,17 @@ impl SlicePushDown {
             ) if !matches!(
                 options.options,
                 Some(JoinTypeOptionsIR::CrossAndFilter { .. })
-            ) =>
+            )
+                && {
+                    #[cfg(feature = "asof_join")]
+                    {
+                        !matches!(&options.args.how, JoinType::AsOfMany(_))
+                    }
+                    #[cfg(not(feature = "asof_join"))]
+                    {
+                        true
+                    }
+                } =>
             {
                 if let Some(existing_slice) = &mut Arc::make_mut(&mut options).args.slice {
                     return if let Some(combined) = combine_outer_inner_slice(
