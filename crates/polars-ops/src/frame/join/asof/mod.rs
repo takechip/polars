@@ -420,10 +420,6 @@ enum MatcherState {
     Nearest(AsofJoinNearestState),
 }
 
-trait AsofPairMatcher {
-    fn next(&mut self, left_idx: usize) -> Option<IdxSize>;
-}
-
 struct NumericAsofPairMatcher<T: PolarsNumericType> {
     left: ChunkedArray<T>,
     right: ChunkedArray<T>,
@@ -459,15 +455,6 @@ where
     }
 }
 
-impl<T: PolarsNumericType> AsofPairMatcher for NumericAsofPairMatcher<T>
-where
-    T::Native: NumericNative + TotalOrd,
-{
-    fn next(&mut self, left_idx: usize) -> Option<IdxSize> {
-        NumericAsofPairMatcher::next(self, left_idx)
-    }
-}
-
 struct OrdAsofPairMatcher<T: PolarsDataType> {
     left: ChunkedArray<T>,
     right: ChunkedArray<T>,
@@ -494,12 +481,42 @@ where
     }
 }
 
-impl<T: PolarsDataType> AsofPairMatcher for OrdAsofPairMatcher<T>
-where
-    for<'a> T::Physical<'a>: TotalOrd,
-{
+enum AsofManyPairMatcher {
+    Int32(NumericAsofPairMatcher<Int32Type>),
+    Int64(NumericAsofPairMatcher<Int64Type>),
+    #[cfg(feature = "dtype-i128")]
+    Int128(NumericAsofPairMatcher<Int128Type>),
+    UInt32(NumericAsofPairMatcher<UInt32Type>),
+    UInt64(NumericAsofPairMatcher<UInt64Type>),
+    #[cfg(feature = "dtype-u128")]
+    UInt128(NumericAsofPairMatcher<UInt128Type>),
+    #[cfg(feature = "dtype-f16")]
+    Float16(NumericAsofPairMatcher<Float16Type>),
+    Float32(NumericAsofPairMatcher<Float32Type>),
+    Float64(NumericAsofPairMatcher<Float64Type>),
+    Boolean(OrdAsofPairMatcher<BooleanType>),
+    Binary(OrdAsofPairMatcher<BinaryType>),
+}
+
+impl AsofManyPairMatcher {
+    #[inline]
     fn next(&mut self, left_idx: usize) -> Option<IdxSize> {
-        OrdAsofPairMatcher::next(self, left_idx)
+        match self {
+            Self::Int32(matcher) => matcher.next(left_idx),
+            Self::Int64(matcher) => matcher.next(left_idx),
+            #[cfg(feature = "dtype-i128")]
+            Self::Int128(matcher) => matcher.next(left_idx),
+            Self::UInt32(matcher) => matcher.next(left_idx),
+            Self::UInt64(matcher) => matcher.next(left_idx),
+            #[cfg(feature = "dtype-u128")]
+            Self::UInt128(matcher) => matcher.next(left_idx),
+            #[cfg(feature = "dtype-f16")]
+            Self::Float16(matcher) => matcher.next(left_idx),
+            Self::Float32(matcher) => matcher.next(left_idx),
+            Self::Float64(matcher) => matcher.next(left_idx),
+            Self::Boolean(matcher) => matcher.next(left_idx),
+            Self::Binary(matcher) => matcher.next(left_idx),
+        }
     }
 }
 
@@ -577,12 +594,12 @@ fn build_asof_many_pair_matcher(
     strategy: AsofStrategy,
     tolerance: Option<AnyValue<'static>>,
     allow_eq: bool,
-) -> PolarsResult<Box<dyn AsofPairMatcher>> {
+) -> PolarsResult<AsofManyPairMatcher> {
     match left_key.dtype() {
         DataType::Int8 | DataType::UInt8 | DataType::Int16 | DataType::UInt16 => {
             let left = left_key.cast(&DataType::Int32)?;
             let right = right_key.cast(&DataType::Int32)?;
-            Ok(Box::new(build_numeric_matcher(
+            Ok(AsofManyPairMatcher::Int32(build_numeric_matcher(
                 left.i32().unwrap().clone(),
                 right.i32().unwrap().clone(),
                 strategy,
@@ -590,14 +607,14 @@ fn build_asof_many_pair_matcher(
                 allow_eq,
             )?))
         },
-        DataType::Int32 => Ok(Box::new(build_numeric_matcher(
+        DataType::Int32 => Ok(AsofManyPairMatcher::Int32(build_numeric_matcher(
             left_key.i32().unwrap().clone(),
             right_key.i32().unwrap().clone(),
             strategy,
             tolerance,
             allow_eq,
         )?)),
-        DataType::Int64 => Ok(Box::new(build_numeric_matcher(
+        DataType::Int64 => Ok(AsofManyPairMatcher::Int64(build_numeric_matcher(
             left_key.i64().unwrap().clone(),
             right_key.i64().unwrap().clone(),
             strategy,
@@ -605,21 +622,21 @@ fn build_asof_many_pair_matcher(
             allow_eq,
         )?)),
         #[cfg(feature = "dtype-i128")]
-        DataType::Int128 => Ok(Box::new(build_numeric_matcher(
+        DataType::Int128 => Ok(AsofManyPairMatcher::Int128(build_numeric_matcher(
             left_key.i128().unwrap().clone(),
             right_key.i128().unwrap().clone(),
             strategy,
             tolerance,
             allow_eq,
         )?)),
-        DataType::UInt32 => Ok(Box::new(build_numeric_matcher(
+        DataType::UInt32 => Ok(AsofManyPairMatcher::UInt32(build_numeric_matcher(
             left_key.u32().unwrap().clone(),
             right_key.u32().unwrap().clone(),
             strategy,
             tolerance,
             allow_eq,
         )?)),
-        DataType::UInt64 => Ok(Box::new(build_numeric_matcher(
+        DataType::UInt64 => Ok(AsofManyPairMatcher::UInt64(build_numeric_matcher(
             left_key.u64().unwrap().clone(),
             right_key.u64().unwrap().clone(),
             strategy,
@@ -627,7 +644,7 @@ fn build_asof_many_pair_matcher(
             allow_eq,
         )?)),
         #[cfg(feature = "dtype-u128")]
-        DataType::UInt128 => Ok(Box::new(build_numeric_matcher(
+        DataType::UInt128 => Ok(AsofManyPairMatcher::UInt128(build_numeric_matcher(
             left_key.u128().unwrap().clone(),
             right_key.u128().unwrap().clone(),
             strategy,
@@ -635,34 +652,34 @@ fn build_asof_many_pair_matcher(
             allow_eq,
         )?)),
         #[cfg(feature = "dtype-f16")]
-        DataType::Float16 => Ok(Box::new(build_numeric_matcher(
+        DataType::Float16 => Ok(AsofManyPairMatcher::Float16(build_numeric_matcher(
             left_key.f16().unwrap().clone(),
             right_key.f16().unwrap().clone(),
             strategy,
             tolerance,
             allow_eq,
         )?)),
-        DataType::Float32 => Ok(Box::new(build_numeric_matcher(
+        DataType::Float32 => Ok(AsofManyPairMatcher::Float32(build_numeric_matcher(
             left_key.f32().unwrap().clone(),
             right_key.f32().unwrap().clone(),
             strategy,
             tolerance,
             allow_eq,
         )?)),
-        DataType::Float64 => Ok(Box::new(build_numeric_matcher(
+        DataType::Float64 => Ok(AsofManyPairMatcher::Float64(build_numeric_matcher(
             left_key.f64().unwrap().clone(),
             right_key.f64().unwrap().clone(),
             strategy,
             tolerance,
             allow_eq,
         )?)),
-        DataType::Boolean => Ok(Box::new(build_ord_matcher(
+        DataType::Boolean => Ok(AsofManyPairMatcher::Boolean(build_ord_matcher(
             left_key.bool().unwrap().clone(),
             right_key.bool().unwrap().clone(),
             strategy,
             allow_eq,
         )?)),
-        DataType::Binary => Ok(Box::new(build_ord_matcher(
+        DataType::Binary => Ok(AsofManyPairMatcher::Binary(build_ord_matcher(
             left_key.binary().unwrap().clone(),
             right_key.binary().unwrap().clone(),
             strategy,
@@ -671,7 +688,7 @@ fn build_asof_many_pair_matcher(
         DataType::String => {
             let left = left_key.cast(&DataType::Binary)?;
             let right = right_key.cast(&DataType::Binary)?;
-            Ok(Box::new(build_ord_matcher(
+            Ok(AsofManyPairMatcher::Binary(build_ord_matcher(
                 left.binary().unwrap().clone(),
                 right.binary().unwrap().clone(),
                 strategy,
