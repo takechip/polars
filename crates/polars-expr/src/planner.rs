@@ -87,7 +87,7 @@ where
         .collect()
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct ExpressionConversionState {
     // settings per context
     // they remain activate between
@@ -97,6 +97,10 @@ pub struct ExpressionConversionState {
     // settings per expression
     // those are reset every expression
     local: LocalConversionState,
+    allow_compaction: bool,
+    full_domain_exprs: Option<Arc<PlHashMap<Node, Arc<dyn PhysicalExpr>>>>,
+    compact_exprs: Vec<(SchemaRef, Node, Arc<dyn PhysicalExpr>, bool)>,
+    planning_depth: usize,
 }
 
 #[derive(Copy, Clone, Default)]
@@ -110,6 +114,10 @@ impl ExpressionConversionState {
         Self {
             allow_threading,
             has_windows: false,
+            allow_compaction: true,
+            full_domain_exprs: None,
+            compact_exprs: Vec::new(),
+            planning_depth: 0,
             local: LocalConversionState {
                 ..Default::default()
             },
@@ -145,8 +153,160 @@ pub fn create_physical_expr(
     }
 }
 
+fn create_compact_ternary_arm(
+    node: Node,
+    physical: Arc<dyn PhysicalExpr>,
+    arena: &mut Arena<AExpr>,
+    schema: &SchemaRef,
+    state: &mut ExpressionConversionState,
+) -> PolarsResult<Option<CompactTernaryArm>> {
+    if !state.allow_compaction || !matches!(arena.get(node), AExpr::Ternary { .. }) {
+        return Ok(None);
+    }
+    let mut stack = vec![node];
+    let mut boundaries = PlHashSet::default();
+    let mut num_ternaries = 0;
+    while let Some(node) = stack.pop() {
+        let ae = arena.get(node);
+        let elementwise = match ae {
+            AExpr::Ternary { .. } => {
+                num_ternaries += 1;
+                true
+            },
+            AExpr::Column(_) | AExpr::BinaryExpr { .. } | AExpr::Cast { .. } => true,
+            AExpr::Literal(lit) => lit.is_scalar(),
+            // Lookup-table inputs are not aligned with the rows being selected.
+            #[cfg(feature = "is_in")]
+            AExpr::Function {
+                function: IRFunctionExpr::Boolean(IRBooleanFunction::IsIn { .. }),
+                ..
+            } => false,
+            #[cfg(feature = "replace")]
+            AExpr::Function {
+                function: IRFunctionExpr::Replace | IRFunctionExpr::ReplaceStrict { .. },
+                ..
+            } => false,
+            AExpr::Function { options, .. } | AExpr::AnonymousFunction { options, .. } => {
+                options.is_elementwise()
+            },
+            _ => false,
+        };
+        if elementwise {
+            ae.inputs(&mut stack);
+        } else if is_scalar_ae(node, arena) || is_length_preserving_ae(node, arena) {
+            boundaries.insert(node);
+        } else {
+            return Ok(None);
+        }
+    }
+    // Short conditional trees seldom amortize filtering and expansion.
+    if num_ternaries < 8 {
+        return Ok(None);
+    }
+    let columns = aexpr_to_leaf_names(node, arena);
+    if columns.is_empty() {
+        return Ok(None);
+    }
+    let needs_full_input = !boundaries.is_empty();
+    let expression = if needs_full_input {
+        let mut full_state = state.clone();
+        full_state.allow_compaction = false;
+        full_state.full_domain_exprs = None;
+        let mut overrides: PlHashMap<_, _> = state
+            .compact_exprs
+            .iter()
+            .filter(|(input_schema, _, _, threading)| {
+                Arc::ptr_eq(input_schema, schema) && *threading == state.allow_threading
+            })
+            .map(|(_, node, expr, _)| (*node, expr.clone()))
+            .collect();
+        for &boundary in &boundaries {
+            if overrides.contains_key(&boundary) {
+                continue;
+            }
+            let expression = create_physical_expr_inner(boundary, arena, schema, &mut full_state)?;
+            let expression = Arc::new(FullDomainExpr(expression)) as Arc<dyn PhysicalExpr>;
+            overrides.insert(boundary, expression.clone());
+            state
+                .compact_exprs
+                .push((schema.clone(), boundary, expression, state.allow_threading));
+        }
+        let mut compact_state = state.clone();
+        // Full-domain selections remain relative to this arm's input frame.
+        compact_state.allow_compaction = false;
+        compact_state.full_domain_exprs = Some(Arc::new(overrides));
+        if let Some(ternary) = physical.as_ternary() {
+            let AExpr::Ternary {
+                predicate,
+                truthy,
+                falsy,
+            } = *arena.get(node)
+            else {
+                unreachable!()
+            };
+            let mut inputs = Vec::with_capacity(3);
+            for (node, original) in [predicate, truthy, falsy].into_iter().zip(ternary.inputs()) {
+                if let Some(expr) = compact_state.full_domain_exprs.as_ref().unwrap().get(&node) {
+                    inputs.push(expr.clone());
+                    continue;
+                }
+                let mut stack = vec![node];
+                let mut needs_full_input = false;
+                while let Some(node) = stack.pop() {
+                    if boundaries.contains(&node) {
+                        needs_full_input = true;
+                        break;
+                    }
+                    arena.get(node).inputs(&mut stack);
+                }
+                inputs.push(if needs_full_input {
+                    create_physical_expr_inner(node, arena, schema, &mut compact_state)?
+                } else {
+                    // Pure subtrees can retain their own compaction opportunities.
+                    original.clone()
+                });
+            }
+            let [predicate, truthy, falsy] = inputs.try_into().ok().unwrap();
+            Arc::new(ternary.with_inputs([predicate, truthy, falsy])) as Arc<dyn PhysicalExpr>
+        } else {
+            create_physical_expr_inner(node, arena, schema, &mut compact_state)?
+        }
+    } else {
+        physical
+    };
+    if needs_full_input {
+        state.compact_exprs.push((
+            schema.clone(),
+            node,
+            expression.clone(),
+            state.allow_threading,
+        ));
+    }
+    Ok(Some(CompactTernaryArm {
+        expression,
+        columns,
+        needs_full_input,
+    }))
+}
+
 #[recursive]
 fn create_physical_expr_inner(
+    expression: Node,
+    expr_arena: &mut Arena<AExpr>,
+    schema: &SchemaRef,
+    state: &mut ExpressionConversionState,
+) -> PolarsResult<Arc<dyn PhysicalExpr>> {
+    // Cached alternatives belong to one expression tree and its input schemas.
+    if state.planning_depth == 0 {
+        state.compact_exprs.clear();
+    }
+    state.planning_depth += 1;
+    let result = create_physical_expr_impl(expression, expr_arena, schema, state);
+    state.planning_depth -= 1;
+    result
+}
+
+fn create_physical_expr_impl(
     expression: Node,
     expr_arena: &mut Arena<AExpr>,
     schema: &SchemaRef, // Schema of the input.
@@ -154,6 +314,13 @@ fn create_physical_expr_inner(
 ) -> PolarsResult<Arc<dyn PhysicalExpr>> {
     use AExpr::*;
 
+    if let Some(expr) = state
+        .full_domain_exprs
+        .as_ref()
+        .and_then(|exprs| exprs.get(&expression))
+    {
+        return Ok(expr.clone());
+    }
     let aexpr = expr_arena.get(expression);
     match aexpr.clone() {
         Len => Ok(Arc::new(phys_expr::LenExpr::new())),
@@ -430,7 +597,7 @@ fn create_physical_expr_inner(
             };
             let input = create_physical_expr_inner(inputs[0].node(), expr_arena, schema, state)?;
             let by = create_physical_expr_inner(inputs[1].node(), expr_arena, schema, state)?;
-            return Ok(Arc::new(new_minmax_by(input, by)));
+            Ok(Arc::new(new_minmax_by(input, by)))
         },
         Cast {
             expr,
@@ -466,6 +633,10 @@ fn create_physical_expr_inner(
                 && !matches!(expr_arena.get(truthy), AExpr::Column(_) | AExpr::Literal(_));
             let mask_falsy = is_elementwise_rec(falsy, expr_arena)
                 && !matches!(expr_arena.get(falsy), AExpr::Column(_) | AExpr::Literal(_));
+            let compact_arms = [
+                create_compact_ternary_arm(truthy, truthy_phys.clone(), expr_arena, schema, state)?,
+                create_compact_ternary_arm(falsy, falsy_phys.clone(), expr_arena, schema, state)?,
+            ];
             let truthy_mask_columns = if mask_truthy {
                 aexpr_to_leaf_names(truthy, expr_arena)
             } else {
@@ -495,6 +666,7 @@ fn create_physical_expr_inner(
                 is_scalar,
                 truthy_mask_columns,
                 falsy_mask_columns,
+                compact_arms,
                 output_dtype,
             )))
         },

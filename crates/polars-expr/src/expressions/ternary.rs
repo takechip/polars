@@ -1,3 +1,4 @@
+use polars_arrow::array::BooleanArray;
 use polars_arrow::bitmap::Bitmap;
 use polars_core::prelude::*;
 use polars_core::runtime::RAYON;
@@ -6,6 +7,55 @@ use recursive::recursive;
 
 use super::*;
 use crate::expressions::{AggregationContext, PhysicalExpr};
+
+pub struct CompactTernaryArm {
+    pub expression: Arc<dyn PhysicalExpr>,
+    pub columns: Vec<PlSmallStr>,
+    pub needs_full_input: bool,
+}
+
+/// Evaluate a dependency on its original input before selecting output rows.
+pub struct FullDomainExpr(pub Arc<dyn PhysicalExpr>);
+
+impl PhysicalExpr for FullDomainExpr {
+    fn as_expression(&self) -> Option<&Expr> {
+        self.0.as_expression()
+    }
+
+    fn evaluate_impl(&self, df: &DataFrame, state: &ExecutionState) -> PolarsResult<Column> {
+        let Some(input) = &state.ternary_input else {
+            return self.0.evaluate(df, state);
+        };
+        let (full_df, filter) = input.as_ref();
+        let mut full_state = state.split();
+        full_state.ternary_input = None;
+        full_state.ternary_active = None;
+        let out = self.0.evaluate(full_df, &full_state)?;
+        if out.len() == 1 {
+            return Ok(out);
+        }
+        polars_ensure!(out.len() == full_df.height(), ShapeMismatch:
+            "when/then/otherwise dependency changed length");
+        out.filter(filter)
+    }
+
+    fn evaluate_on_groups_impl<'a>(
+        &self,
+        df: &DataFrame,
+        groups: &'a GroupPositions,
+        state: &ExecutionState,
+    ) -> PolarsResult<AggregationContext<'a>> {
+        self.0.evaluate_on_groups(df, groups, state)
+    }
+
+    fn to_field(&self, input_schema: &Schema) -> PolarsResult<Field> {
+        self.0.to_field(input_schema)
+    }
+
+    fn is_scalar(&self) -> bool {
+        self.0.is_scalar()
+    }
+}
 
 pub struct TernaryExpr {
     predicate: Arc<dyn PhysicalExpr>,
@@ -17,6 +67,7 @@ pub struct TernaryExpr {
     returns_scalar: bool,
     truthy_mask_columns: Vec<PlSmallStr>,
     falsy_mask_columns: Vec<PlSmallStr>,
+    compact_arms: [Option<CompactTernaryArm>; 2],
     // The dtype of this expression, which is the supertype of the arms and thus
     // can differ from the dtype of an individual arm.
     output_dtype: Option<DataType>,
@@ -33,6 +84,7 @@ impl TernaryExpr {
         returns_scalar: bool,
         truthy_mask_columns: Vec<PlSmallStr>,
         falsy_mask_columns: Vec<PlSmallStr>,
+        compact_arms: [Option<CompactTernaryArm>; 2],
         output_dtype: Option<DataType>,
     ) -> Self {
         Self {
@@ -44,8 +96,72 @@ impl TernaryExpr {
             returns_scalar,
             truthy_mask_columns,
             falsy_mask_columns,
+            compact_arms,
             output_dtype,
         }
+    }
+
+    pub(crate) fn inputs(&self) -> [&Arc<dyn PhysicalExpr>; 3] {
+        [&self.predicate, &self.truthy, &self.falsy]
+    }
+
+    pub(crate) fn with_inputs(
+        &self,
+        [predicate, truthy, falsy]: [Arc<dyn PhysicalExpr>; 3],
+    ) -> Self {
+        Self {
+            predicate,
+            truthy,
+            falsy,
+            expr: self.expr.clone(),
+            run_par: self.run_par,
+            returns_scalar: self.returns_scalar,
+            truthy_mask_columns: self.truthy_mask_columns.clone(),
+            falsy_mask_columns: self.falsy_mask_columns.clone(),
+            compact_arms: [None, None],
+            output_dtype: self.output_dtype.clone(),
+        }
+    }
+
+    fn evaluate_compacted(
+        &self,
+        arm: &CompactTernaryArm,
+        mask: &Bitmap,
+        df: &DataFrame,
+        state: &ExecutionState,
+    ) -> PolarsResult<Column> {
+        let filter: BooleanChunked = BooleanArray::from_data_default(mask.clone(), None).into();
+        let height = filter.num_trues();
+        let columns = arm
+            .columns
+            .iter()
+            .map(|name| df.column(name)?.filter(&filter))
+            .collect::<PolarsResult<Vec<_>>>()?;
+        let compacted = DataFrame::new(height, columns)?;
+        let mut compact_state = state.split();
+        compact_state.ternary_active = None;
+        if arm.needs_full_input {
+            compact_state.ternary_input = Some(Arc::new((df.clone(), filter)));
+        }
+        let out = arm.expression.evaluate(&compacted, &compact_state)?;
+        if out.len() == 1 {
+            return Ok(out);
+        }
+        polars_ensure!(out.len() == height, ShapeMismatch:
+            "elementwise when/then/otherwise arm changed length");
+
+        let mut next = 0 as IdxSize;
+        let indices: IdxCa = mask
+            .iter()
+            .map(|selected| {
+                selected.then(|| {
+                    let index = next;
+                    next += 1;
+                    index
+                })
+            })
+            .collect();
+        out.take(&indices)
     }
 
     /// Casts an arm we return directly to the output dtype of this expression.
@@ -102,6 +218,10 @@ fn finish_as_iters<'a>(
 }
 
 impl PhysicalExpr for TernaryExpr {
+    fn as_ternary(&self) -> Option<&TernaryExpr> {
+        Some(self)
+    }
+
     fn as_expression(&self) -> Option<&Expr> {
         Some(&self.expr)
     }
@@ -119,7 +239,8 @@ impl PhysicalExpr for TernaryExpr {
         let false_count = mask.len() - true_count;
 
         let mask_bitmap = (!self.truthy_mask_columns.is_empty()
-            || !self.falsy_mask_columns.is_empty())
+            || !self.falsy_mask_columns.is_empty()
+            || self.compact_arms.iter().any(Option::is_some))
         .then(|| {
             mask.rechunk_mut();
             let arr = mask.downcast_as_array();
@@ -136,20 +257,52 @@ impl PhysicalExpr for TernaryExpr {
                 .collect();
             DataFrame::new(df.height(), columns)
         };
-        let op_truthy = || {
-            if self.truthy_mask_columns.is_empty() || false_count == 0 {
-                return self.truthy.evaluate(df, &state);
+        let evaluate_arm = |idx: usize, selected_count: usize| {
+            let (expr, names) = if idx == 0 {
+                (&self.truthy, &self.truthy_mask_columns)
+            } else {
+                (&self.falsy, &self.falsy_mask_columns)
+            };
+            if selected_count == mask.len() && state.ternary_active.is_none() {
+                return expr.evaluate(df, &state);
             }
-            let mask_df = masked_df(&self.truthy_mask_columns, mask_bitmap.as_ref().unwrap())?;
-            self.truthy.evaluate(&mask_df, &state)
-        };
-        let op_falsy = || {
-            if self.falsy_mask_columns.is_empty() || true_count == 0 {
-                return self.falsy.evaluate(df, &state);
+            let mut branch_state = None;
+            let mut selected = None;
+            if let Some(arm) = &self.compact_arms[idx]
+                && mask.len() == df.height()
+                && mask.len() >= 1024
+            {
+                let bitmap = mask_bitmap.as_ref().unwrap();
+                let bitmap = if idx == 0 { bitmap.clone() } else { !bitmap };
+                let bitmap = match &state.ternary_active {
+                    Some(active) => &bitmap & active,
+                    None => bitmap,
+                };
+                let count = bitmap.set_bits();
+                if count > 0 && count <= mask.len() / 8 {
+                    return self.evaluate_compacted(arm, &bitmap, df, &state);
+                }
+                // Inactive rows may be discarded only inside a fully rowwise subtree.
+                if !arm.needs_full_input {
+                    let mut next_state = state.split();
+                    next_state.ternary_active = Some(bitmap.clone());
+                    branch_state = Some(next_state);
+                }
+                selected = Some(bitmap);
             }
-            let mask_df = masked_df(&self.falsy_mask_columns, &!mask_bitmap.as_ref().unwrap())?;
-            self.falsy.evaluate(&mask_df, &state)
+            let state = branch_state.as_ref().unwrap_or(&state);
+            if names.is_empty() || selected_count == mask.len() {
+                return expr.evaluate(df, state);
+            }
+            let bitmap = selected.unwrap_or_else(|| {
+                let bitmap = mask_bitmap.as_ref().unwrap();
+                if idx == 0 { bitmap.clone() } else { !bitmap }
+            });
+            let mask_df = masked_df(names, &bitmap)?;
+            expr.evaluate(&mask_df, state)
         };
+        let op_truthy = || evaluate_arm(0, true_count);
+        let op_falsy = || evaluate_arm(1, false_count);
 
         let (truthy, falsy);
         if true_count == 0 {

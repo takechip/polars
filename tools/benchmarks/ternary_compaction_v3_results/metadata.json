@@ -1,0 +1,26 @@
+{
+  "recorded_at_utc": "2026-09-21T15:25:27.912470+00:00",
+  "baseline_commit": "950d567d0220b934c7683e5e85c0484a5d0c8f25",
+  "python": "3.13.5",
+  "platform": "macOS-15.7.7-arm64-arm-64bit-Mach-O",
+  "cpu": "Apple M4",
+  "ram_bytes": 17179869184,
+  "rustc": "rustc 1.100.0-nightly (0dfb098f3 2026-08-31)",
+  "profile": "dist-release",
+  "lto": "fat",
+  "codegen_units": 1,
+  "cargo_args": "--locked --features backtrace_filter",
+  "benchmark_threads": 4,
+  "test_threads_per_worker": 2,
+  "test_workers": 4,
+  "baseline_runtime_sha256": "ce4412560a2068eaaf096e9734832d052834814b7bc0ffe796b019866d1c9dbb",
+  "candidate_runtime_sha256": "2f074805414de5d9900a3487b0319de4fe045744bf8f2cd7e693d716c5fd4702",
+  "source_sha256": {
+    "crates/polars-expr/src/planner.rs": "c5777d2524ac004a52295d90b6947c08a2d43df491d0f317837456d96c2739fe",
+    "crates/polars-expr/src/expressions/ternary.rs": "1dad3574aae8e0624c37aeb21fd840627063a8d6d8abfdcda1c249fc1a9034cb",
+    "crates/polars-expr/src/state/execution_state.rs": "0f1c698605f226174cecc0f9b7f735aab9ba04cee5b3661b7e47cfc7b242a745",
+    "py-polars/tests/unit/functions/test_when_then_compaction.py": "9f30c85502c0a0f3eeb0104597f8cb360ddfac8b108fee460c65b0275e715f72",
+    "tools/benchmarks/ternary_compaction.py": "d0c6858a0589b8609c78dcbd8c89f658ff0416dd8146230c1618ffc280f09b46",
+    "crates/polars-expr/src/expressions/mod.rs": "f7d74b574cf6893432a7924ec87dcfd49a971910025cb59b32bcba382dc7dbc8"
+  }
+}
