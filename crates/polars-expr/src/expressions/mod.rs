@@ -701,6 +701,10 @@ pub trait PhysicalExpr: Send + Sync {
         None
     }
 
+    fn as_ternary(&self) -> Option<&TernaryExpr> {
+        None
+    }
+
     /// Take a DataFrame and evaluate the expression.
     ///
     /// Note: implementers should implement evaluate_impl instead, as this wraps

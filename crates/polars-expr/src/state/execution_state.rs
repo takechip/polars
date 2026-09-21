@@ -125,6 +125,10 @@ pub struct ExecutionState {
     #[cfg(feature = "dtype-struct")]
     pub with_fields_ac: Option<Arc<AggregationContext<'static>>>,
     pub element: Arc<Option<(Column, Option<Bitmap>)>>,
+    /// Original input and selected rows of a compacted conditional arm.
+    pub(crate) ternary_input: Option<Arc<(DataFrame, BooleanChunked)>>,
+    /// Rows still needed inside a recursively elementwise conditional arm.
+    pub(crate) ternary_active: Option<Bitmap>,
     stop: Arc<RelaxedCell<bool>>,
 }
 
@@ -145,6 +149,8 @@ impl ExecutionState {
             #[cfg(feature = "dtype-struct")]
             with_fields_ac: Default::default(),
             element: Default::default(),
+            ternary_input: None,
+            ternary_active: None,
             stop: Arc::new(RelaxedCell::from(false)),
         }
     }
@@ -171,6 +177,8 @@ impl ExecutionState {
             flags: self.flags.clone(),
             // Retain input values for `pl.element` in Eval context
             element: self.element.clone(),
+            ternary_input: self.ternary_input.clone(),
+            ternary_active: self.ternary_active.clone(),
             #[cfg(feature = "dtype-struct")]
             with_fields: self.with_fields.clone(),
             #[cfg(feature = "dtype-struct")]
